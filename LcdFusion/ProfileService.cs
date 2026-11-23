@@ -15,15 +15,25 @@ namespace LcdFusion
         public bool ShowLabel = true;
     }
 
+    public sealed class WallpaperPropEntry
+    {
+        public string Key = "";
+        public string Value = "";
+    }
+
     public sealed class SceneData
     {
         public int Background;
         public string MediaPath = "";
-        public byte[] MediaData;   // embedded image/GIF bytes so profiles are self-contained
+        public byte[] MediaData;   // embedded image/GIF bytes so profiles are self-contained (null for Wallpaper)
+        public string WallpaperType = "";
+        public List<WallpaperPropEntry> WallpaperProps = new List<WallpaperPropEntry>();
         public int BgColorArgb;
         public double Rotation;
         public bool FlipH;
         public double Scale = 1.0;
+        public double ScaleX = 1.0;
+        public double ScaleY = 1.0;
         public double PanX, PanY;
         public int Fit;
         public List<OverlayData> Overlays = new List<OverlayData>();
@@ -32,10 +42,13 @@ namespace LcdFusion
     public sealed class ProfileData
     {
         public SceneData Valk = new SceneData();
+        public SceneData BoWei;         // null in older profile files
         public SceneData Thermal = new SceneData();
         public bool TargetValk = true;
+        public bool TargetBoWei;
         public bool TargetThermal;
-        public bool ActiveValk = true;
+        public bool ActiveValk = true;  // kept for backward compatibility with older profile files
+        public int ActiveScreen = -1;   // -1 => derive from ActiveValk
         public bool Streaming = true;   // streaming is on by default / when not present in old files
     }
 
@@ -44,6 +57,14 @@ namespace LcdFusion
         public string Lang = "";
         public string LastProfile = "";
         public string LastSeenVersion = "";
+        public string ValkyriePanel = "auto";
+        public string LastDetectedValkyriePanel = "";
+        public int ValkyrieRotation = -1; // -1 = auto (90° for 360x960 landscape mount, 0° otherwise)
+        public int BoWeiRotation;
+        public int ThermalrightRotation;
+        public int BoWeiBrightness = 80;
+        public string WallpaperAssetsDir = "";
+        public string WallpaperRendererPath = "";
         public List<int> RecentColors = new List<int>();
     }
 

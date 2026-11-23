@@ -10,75 +10,9 @@ using System.Threading;
 
 namespace LcdFusion
 {
-    // Decodes one GIF and exposes the current frame with per-frame timing.
-    internal sealed class GifState : IDisposable
-    {
-        private readonly Image _image;
-        private readonly MemoryStream _stream;
-        private readonly int[] _delaysMs;
-        private readonly int _count;
-        private int _index;
-        private int _elapsed;
-
-        private GifState(Image image, MemoryStream stream, int[] delays)
-        {
-            _image = image; _stream = stream; _delaysMs = delays; _count = delays.Length;
-        }
-
-        public static GifState Load(string path)
-        {
-            return LoadBytes(File.ReadAllBytes(path));
-        }
-
-        public static GifState LoadBytes(byte[] data)
-        {
-            MemoryStream stream = new MemoryStream(data);
-            Image image = Image.FromStream(stream);
-            int count = 1;
-            try { count = image.GetFrameCount(FrameDimension.Time); } catch { count = 1; }
-            if (count < 1) count = 1;
-            int[] delays = new int[count];
-            try
-            {
-                PropertyItem item = image.GetPropertyItem(0x5100);
-                for (int i = 0; i < count; i++)
-                {
-                    int ticks = BitConverter.ToInt32(item.Value, i * 4) * 10;
-                    delays[i] = ticks <= 10 ? 100 : ticks;
-                }
-            }
-            catch { for (int i = 0; i < count; i++) delays[i] = 100; }
-            return new GifState(image, stream, delays);
-        }
-
-        public Image CurrentFrame()
-        {
-            _image.SelectActiveFrame(FrameDimension.Time, _index);
-            return _image;
-        }
-
-        public void Advance(int deltaMs)
-        {
-            if (_count <= 1) return;
-            _elapsed += deltaMs;
-            int guard = 0;
-            while (_elapsed >= _delaysMs[_index] && guard++ < _count + 1)
-            {
-                _elapsed -= _delaysMs[_index];
-                _index = (_index + 1) % _count;
-            }
-        }
-
-        public void Dispose()
-        {
-            try { _image.Dispose(); } catch { }
-            try { _stream.Dispose(); } catch { }
-        }
-    }
-
-    internal enum BackgroundKind { None, Color, Image, Gif }
+    internal enum BackgroundKind { None, Color, Image, Gif, Wallpaper }
     internal enum OverlayKind { Text, CpuTemp, GpuTemp, CpuLoad, GpuLoad, Clock, Date, CpuClock, GpuClock, CpuPower, GpuPower, GpuVram, RamLoad, GpuFan, CpuCores }
-    internal enum FitMode { Fit, Fill }
+    internal enum FitMode { Fit, Fill, Stretch }
 
     // A movable text/sensor layer drawn on top of the background.
     internal sealed class Overlay
@@ -104,20 +38,35 @@ namespace LcdFusion
         public BackgroundKind Background = BackgroundKind.None;
         public string MediaName = "";
         public string MediaPath = "";
+        public string WallpaperType = "";
+        public readonly Dictionary<string, string> WallpaperProps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         public byte[] MediaBytes;
-        public Image ImageSource;
-        public GifState Gif;
+        public IBackgroundSource Source;
         public Color BgColor = Color.FromArgb(11, 16, 32);
         public double Rotation;    // degrees (free)
         public bool FlipH;
         public double Scale = 1.0;
+        public double ScaleX = 1.0; // independent horizontal stretch factor (used in FitMode.Stretch)
+        public double ScaleY = 1.0; // independent vertical stretch factor (used in FitMode.Stretch)
         public double PanX;        // fraction of width
         public double PanY;        // fraction of height
         public FitMode Fit = FitMode.Fit;
         public readonly List<Overlay> Overlays = new List<Overlay>();
 
+        public bool HasTransformableMedia()
+        {
+            return Background == BackgroundKind.Image || Background == BackgroundKind.Gif || Background == BackgroundKind.Wallpaper;
+        }
+
+        public bool IsWebWallpaper()
+        {
+            return Background == BackgroundKind.Wallpaper &&
+                   string.Equals(WallpaperType, "web", StringComparison.OrdinalIgnoreCase);
+        }
+
         public bool NeedsSensorData()
         {
+            if (IsWebWallpaper()) return true;
             foreach (Overlay o in Overlays)
                 if (IsSensorOverlay(o.Kind)) return true;
             return false;
@@ -128,14 +77,26 @@ namespace LcdFusion
             return RefreshIntervalMs(33);
         }
 
-        public int StreamIntervalMs(bool valkyrie)
+        public int StreamIntervalMs(ScreenId screen)
         {
-            return RefreshIntervalMs(valkyrie ? 50 : 150);
+            int dynamicMs = screen == ScreenId.BoWei ? 33 : (screen == ScreenId.Valkyrie ? 40 : 150);
+            return RefreshIntervalMs(dynamicMs);
         }
 
-        private int RefreshIntervalMs(int gifIntervalMs)
+        public int TargetRendererFps(ScreenId screen)
         {
-            if (Background == BackgroundKind.Gif) return gifIntervalMs;
+            switch (screen)
+            {
+                case ScreenId.BoWei: return 30;
+                case ScreenId.Valkyrie: return 25;
+                case ScreenId.Thermalright: return 10;
+                default: return 25;
+            }
+        }
+
+        private int RefreshIntervalMs(int dynamicIntervalMs)
+        {
+            if (Background == BackgroundKind.Gif || Background == BackgroundKind.Wallpaper) return dynamicIntervalMs;
             bool hasDate = false;
             foreach (Overlay o in Overlays)
             {
@@ -167,10 +128,17 @@ namespace LcdFusion
             }
         }
 
+        public IBackgroundSource DetachSource()
+        {
+            IBackgroundSource old = Source;
+            Source = null;
+            return old;
+        }
+
         public void DisposeSources()
         {
-            if (Gif != null) { Gif.Dispose(); Gif = null; }
-            if (ImageSource != null) { ImageSource.Dispose(); ImageSource = null; }
+            IBackgroundSource old = DetachSource();
+            if (old != null) { try { old.Dispose(); } catch { } }
         }
     }
 
@@ -184,28 +152,134 @@ namespace LcdFusion
         private volatile bool _streaming;
 
         private readonly LcdScene _valk = new LcdScene();
+        private readonly LcdScene _bowei = new LcdScene();
         private readonly LcdScene _thermal = new LcdScene();
+        private readonly List<IBackgroundSource> _pendingDispose = new List<IBackgroundSource>();
+        private string _wallpaperRendererPath = "";
+        private string _wallpaperAssetsDir = "";
         private bool _targetValk = true;
+        private bool _targetBoWei;
         private bool _targetThermal;
-        private bool _previewValk = true;
+        private int _valkRotation = -1; // -1 = auto (90° for 360x960 landscape secondary screen)
+        private int _boweiRotation;
+        private int _thermalRotation;
+        private ScreenId _previewScreen = ScreenId.Valkyrie;
         private bool _previewEnabled = true;
 
         private SensorReading _sensors = new SensorReading();
         private byte[] _previewPng;
-        private bool _dirtyValk = true, _dirtyThermal = true, _dirtyPreview = true;
+        private bool _dirtyValk = true, _dirtyBoWei = true, _dirtyThermal = true, _dirtyPreview = true;
 
+        private string _valkError, _boweiError, _thermalError;
+        private string _valkWpeError, _boweiWpeError, _thermalWpeError;
         private string _status = "Pronto";
         private bool _statusOk = true;
         public Action<bool, string> StatusChanged;
 
-        public ContentEngine()
+        public ContentEngine(int valkRotation = -1, int boweiRotation = 0, int thermalRotation = 0)
         {
-            // Default each screen to a simple live dashboard.
-            _valk.Overlays.Add(new Overlay { Kind = OverlayKind.CpuTemp, X = 0.5, Y = 0.30, Size = 0.26 });
-            _valk.Overlays.Add(new Overlay { Kind = OverlayKind.GpuTemp, X = 0.5, Y = 0.70, Size = 0.26 });
+            _valkRotation = NormalizeRotationSetting(valkRotation, true);
+            _boweiRotation = NormalizeRotationSetting(boweiRotation, false);
+            _thermalRotation = NormalizeRotationSetting(thermalRotation, false);
+
+            // Default each screen to a simple live dashboard sized to its canvas aspect ratio.
+            int vw, vh;
+            CanvasSize(ScreenId.Valkyrie, out vw, out vh);
+            if (vw > vh * 2)
+            {
+                _valk.Overlays.Add(new Overlay { Kind = OverlayKind.CpuTemp, X = 0.22, Y = 0.50, Size = 0.36 });
+                _valk.Overlays.Add(new Overlay { Kind = OverlayKind.GpuTemp, X = 0.52, Y = 0.50, Size = 0.36 });
+                _valk.Overlays.Add(new Overlay { Kind = OverlayKind.Clock, X = 0.82, Y = 0.50, Size = 0.30, ShowLabel = false });
+            }
+            else if (vh > vw)
+            {
+                _valk.Overlays.Add(new Overlay { Kind = OverlayKind.CpuTemp, X = 0.5, Y = 0.25, Size = 0.09 });
+                _valk.Overlays.Add(new Overlay { Kind = OverlayKind.GpuTemp, X = 0.5, Y = 0.50, Size = 0.09 });
+                _valk.Overlays.Add(new Overlay { Kind = OverlayKind.Clock, X = 0.5, Y = 0.75, Size = 0.07, ShowLabel = false });
+            }
+            else
+            {
+                _valk.Overlays.Add(new Overlay { Kind = OverlayKind.CpuTemp, X = 0.5, Y = 0.30, Size = 0.26 });
+                _valk.Overlays.Add(new Overlay { Kind = OverlayKind.GpuTemp, X = 0.5, Y = 0.70, Size = 0.26 });
+            }
+
+            _bowei.Overlays.Add(new Overlay { Kind = OverlayKind.CpuTemp, X = 0.5, Y = 0.32, Size = 0.18 });
+            _bowei.Overlays.Add(new Overlay { Kind = OverlayKind.GpuTemp, X = 0.5, Y = 0.68, Size = 0.18 });
+
             _thermal.Overlays.Add(new Overlay { Kind = OverlayKind.CpuTemp, X = 0.20, Y = 0.5, Size = 0.5 });
             _thermal.Overlays.Add(new Overlay { Kind = OverlayKind.GpuTemp, X = 0.52, Y = 0.5, Size = 0.5 });
             _thermal.Overlays.Add(new Overlay { Kind = OverlayKind.Clock, X = 0.83, Y = 0.5, Size = 0.42, ShowLabel = false });
+        }
+
+        private static int NormalizeRotationSetting(int degrees, bool allowAuto)
+        {
+            if (allowAuto && degrees < 0) return -1;
+            int r = ((degrees % 360) + 360) % 360;
+            if (r == 90 || r == 180 || r == 270) return r;
+            return 0;
+        }
+
+        public int EffectiveRotation(ScreenId screen)
+        {
+            int raw;
+            lock (_lock)
+            {
+                switch (screen)
+                {
+                    case ScreenId.BoWei: raw = _boweiRotation; break;
+                    case ScreenId.Thermalright: raw = _thermalRotation; break;
+                    default: raw = _valkRotation; break;
+                }
+            }
+            if (screen == ScreenId.Valkyrie && raw < 0)
+            {
+                // The 360x960 secondary display is physically mounted landscape (960x360, wire rotated 90° CCW).
+                // Rotating the 960x360 canvas 90° CW before sending makes the physical display upright.
+                return (ValkyrieDirectService.Width == 360 && ValkyrieDirectService.Height == 960) ? 90 : 0;
+            }
+            return raw < 0 ? 0 : raw;
+        }
+
+        public void SetScreenRotation(ScreenId screen, int degrees)
+        {
+            int norm = NormalizeRotationSetting(degrees, screen == ScreenId.Valkyrie);
+            lock (_lock)
+            {
+                switch (screen)
+                {
+                    case ScreenId.BoWei: _boweiRotation = norm; break;
+                    case ScreenId.Thermalright: _thermalRotation = norm; break;
+                    default: _valkRotation = norm; break;
+                }
+                MarkDirty(screen);
+            }
+        }
+
+        public void CanvasSize(ScreenId screen, out int width, out int height)
+        {
+            int wireW, wireH;
+            NativeSize(screen, out wireW, out wireH);
+            int rot = EffectiveRotation(screen);
+            if (rot == 90 || rot == 270)
+            {
+                width = wireH;
+                height = wireW;
+            }
+            else
+            {
+                width = wireW;
+                height = wireH;
+            }
+        }
+
+        private static void ApplyHardwareRotation(Bitmap bmp, int rotation)
+        {
+            switch (rotation)
+            {
+                case 90: bmp.RotateFlip(RotateFlipType.Rotate90FlipNone); break;
+                case 180: bmp.RotateFlip(RotateFlipType.Rotate180FlipNone); break;
+                case 270: bmp.RotateFlip(RotateFlipType.Rotate270FlipNone); break;
+            }
         }
 
         // ---- lifecycle --------------------------------------------------------------
@@ -222,26 +296,105 @@ namespace LcdFusion
         {
             _alive = false; _streaming = false;
             try { ValkyrieDirectService.Stop(); } catch { }
+            try { BoWeiDirectService.Stop(); } catch { }
             try { ThermalrightDirectService.Stop(); } catch { }
             Thread thread = _thread;
             if (thread != null && thread != Thread.CurrentThread) thread.Join(2000);
-            lock (_lock) { _valk.DisposeSources(); _thermal.DisposeSources(); }
+            lock (_lock)
+            {
+                _valk.DisposeSources();
+                _bowei.DisposeSources();
+                _thermal.DisposeSources();
+                DrainPendingDisposeLocked();
+            }
+        }
+
+        public void ConfigureWallpaper(string rendererPath, string assetsDir)
+        {
+            lock (_lock)
+            {
+                _wallpaperRendererPath = rendererPath ?? "";
+                _wallpaperAssetsDir = assetsDir ?? "";
+            }
+        }
+
+        public string ResolvedWallpaperRendererPath()
+        {
+            string configured;
+            lock (_lock) { configured = _wallpaperRendererPath; }
+            return WallpaperCatalog.ResolveRendererExecutable(configured);
+        }
+
+        public string ResolvedWallpaperAssetsDir()
+        {
+            string configured;
+            lock (_lock) { configured = _wallpaperAssetsDir; }
+            return WallpaperCatalog.DetectWallpaperEngineAssetsDir(configured);
+        }
+
+        private void ReplaceSourceLocked(LcdScene scene, IBackgroundSource next)
+        {
+            IBackgroundSource old = scene.DetachSource();
+            if (old != null) _pendingDispose.Add(old);
+            scene.Source = next;
+        }
+
+        private void DrainPendingDisposeLocked()
+        {
+            if (_pendingDispose.Count == 0) return;
+            for (int i = 0; i < _pendingDispose.Count; i++)
+            {
+                try { _pendingDispose[i].Dispose(); } catch { }
+            }
+            _pendingDispose.Clear();
         }
 
         // ---- editing API ------------------------------------------------------------
 
-        public LcdScene Scene(bool valkyrie) { return valkyrie ? _valk : _thermal; }
-
-        public void Edit(bool valkyrie, Action<LcdScene> mutation)
+        public LcdScene Scene(ScreenId screen)
         {
-            lock (_lock)
+            switch (screen)
             {
-                mutation(valkyrie ? _valk : _thermal);
-                MarkDirty(valkyrie);
+                case ScreenId.BoWei: return _bowei;
+                case ScreenId.Thermalright: return _thermal;
+                default: return _valk;
             }
         }
 
-        public void LoadImage(bool valkyrie, string path)
+        public static void NativeSize(ScreenId screen, out int width, out int height)
+        {
+            switch (screen)
+            {
+                case ScreenId.BoWei:
+                    width = BoWeiDirectService.Width;
+                    height = BoWeiDirectService.Height;
+                    break;
+                case ScreenId.Thermalright:
+                    width = ThermalrightDirectService.CanvasWidth;
+                    height = ThermalrightDirectService.CanvasHeight;
+                    break;
+                default:
+                    width = ValkyrieDirectService.Width;
+                    height = ValkyrieDirectService.Height;
+                    break;
+            }
+        }
+
+        public void InvalidateScreen(ScreenId screen)
+        {
+            lock (_lock) { MarkDirty(screen); }
+        }
+
+        public void Edit(ScreenId screen, Action<LcdScene> mutation)
+        {
+            lock (_lock)
+            {
+                mutation(Scene(screen));
+                MarkDirty(screen);
+            }
+        }
+
+        public void LoadImage(ScreenId screen, string path)
         {
             try
             {
@@ -251,21 +404,22 @@ namespace LcdFusion
                 using (Image tmp = Image.FromStream(ms)) loaded = new Bitmap(tmp);
                 lock (_lock)
                 {
-                    LcdScene scene = valkyrie ? _valk : _thermal;
-                    scene.DisposeSources();
-                    scene.ImageSource = loaded;
+                    LcdScene scene = Scene(screen);
+                    ReplaceSourceLocked(scene, new StaticImageSource(loaded));
                     scene.MediaBytes = bytes;
                     scene.MediaName = Path.GetFileName(path);
                     scene.MediaPath = path;
+                    scene.WallpaperType = "";
+                    scene.WallpaperProps.Clear();
                     scene.Background = BackgroundKind.Image;
-                    scene.Scale = 1.0; scene.PanX = 0; scene.PanY = 0; scene.Rotation = 0; scene.FlipH = false;
-                    MarkDirty(valkyrie);
+                    scene.Scale = 1.0; scene.ScaleX = 1.0; scene.ScaleY = 1.0; scene.PanX = 0; scene.PanY = 0; scene.Rotation = 0; scene.FlipH = false;
+                    MarkDirty(screen);
                 }
             }
             catch (Exception ex) { Report(false, Loc.T("err.image") + ex.Message); }
         }
 
-        public void LoadGif(bool valkyrie, string path)
+        public void LoadGif(ScreenId screen, string path)
         {
             try
             {
@@ -273,43 +427,160 @@ namespace LcdFusion
                 GifState loaded = GifState.LoadBytes(bytes);
                 lock (_lock)
                 {
-                    LcdScene scene = valkyrie ? _valk : _thermal;
-                    scene.DisposeSources();
-                    scene.Gif = loaded;
+                    LcdScene scene = Scene(screen);
+                    ReplaceSourceLocked(scene, loaded);
                     scene.MediaBytes = bytes;
                     scene.MediaName = Path.GetFileName(path);
                     scene.MediaPath = path;
+                    scene.WallpaperType = "";
+                    scene.WallpaperProps.Clear();
                     scene.Background = BackgroundKind.Gif;
-                    scene.Scale = 1.0; scene.PanX = 0; scene.PanY = 0; scene.Rotation = 0; scene.FlipH = false;
-                    MarkDirty(valkyrie);
+                    scene.Scale = 1.0; scene.ScaleX = 1.0; scene.ScaleY = 1.0; scene.PanX = 0; scene.PanY = 0; scene.Rotation = 0; scene.FlipH = false;
+                    MarkDirty(screen);
                 }
             }
             catch (Exception ex) { Report(false, Loc.T("err.gif") + ex.Message); }
         }
 
-        public void SetBackgroundKind(bool valkyrie, BackgroundKind kind)
+        public bool LoadWallpaper(ScreenId screen, string wallpaperDir, Dictionary<string, string> initialProps = null)
         {
-            lock (_lock)
+            try
             {
-                LcdScene scene = valkyrie ? _valk : _thermal;
-                if (kind == BackgroundKind.None || kind == BackgroundKind.Color)
+                WallpaperEntry entry = WallpaperCatalog.TryLoadWallpaperDir(wallpaperDir);
+                if (entry == null)
+                    throw new DirectoryNotFoundException(wallpaperDir ?? "");
+
+                string rendererExe = ResolvedWallpaperRendererPath();
+                if (string.IsNullOrEmpty(rendererExe))
+                    throw new FileNotFoundException(Loc.T("err.wpeNoRenderer"));
+
+                string assetsDir = ResolvedWallpaperAssetsDir();
+                int cw, ch;
+                CanvasSize(screen, out cw, out ch);
+                int fps;
+                lock (_lock) { fps = Scene(screen).TargetRendererFps(screen); }
+
+                Dictionary<string, object> typedProps = WallpaperCatalog.ConvertPropsToTypedMap(initialProps, entry.Properties);
+                WallpaperFrameSource source = new WallpaperFrameSource(screen, rendererExe, entry.Directory, assetsDir, cw, ch, fps, typedProps);
+                SensorReading snapSensors = null;
+                lock (_lock)
                 {
-                    scene.DisposeSources();
-                    scene.MediaBytes = null; scene.MediaName = ""; scene.MediaPath = "";
+                    LcdScene scene = Scene(screen);
+                    ReplaceSourceLocked(scene, source);
+                    scene.MediaBytes = null;
+                    scene.MediaName = entry.DisplayTitle;
+                    scene.MediaPath = entry.Directory;
+                    scene.WallpaperType = entry.Type ?? "scene";
+                    scene.WallpaperProps.Clear();
+                    if (initialProps != null)
+                    {
+                        foreach (KeyValuePair<string, string> kv in initialProps)
+                            if (!string.IsNullOrEmpty(kv.Key)) scene.WallpaperProps[kv.Key] = kv.Value ?? "";
+                    }
+                    scene.Background = BackgroundKind.Wallpaper;
+                    scene.Scale = 1.0; scene.ScaleX = 1.0; scene.ScaleY = 1.0; scene.PanX = 0; scene.PanY = 0; scene.Rotation = 0; scene.FlipH = false;
+                    scene.Fit = FitMode.Fill;
+                    if (scene.IsWebWallpaper() && _sensors != null && _sensors.Available)
+                        snapSensors = _sensors;
+                    MarkDirty(screen);
                 }
-                scene.Background = kind;
-                MarkDirty(valkyrie);
+                if (snapSensors != null)
+                    source.SetSensors(BuildSensorPayload(snapSensors));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Report(false, Loc.T("err.wallpaper") + ex.Message);
+                return false;
             }
         }
 
-        public void SetTargets(bool valkyrie, bool thermalright)
+        public void SetWallpaperProperties(ScreenId screen, Dictionary<string, string> overrides, List<WallpaperPropertyDef> defs = null)
         {
-            lock (_lock) { _targetValk = valkyrie; _targetThermal = thermalright; }
+            if (overrides == null) return;
+            WallpaperFrameSource wpe;
+            string mediaPath;
+            lock (_lock)
+            {
+                LcdScene scene = Scene(screen);
+                if (scene.Background != BackgroundKind.Wallpaper) return;
+                foreach (KeyValuePair<string, string> kv in overrides)
+                {
+                    if (string.IsNullOrEmpty(kv.Key)) continue;
+                    scene.WallpaperProps[kv.Key] = kv.Value ?? "";
+                }
+                wpe = scene.Source as WallpaperFrameSource;
+                mediaPath = scene.MediaPath;
+                MarkDirty(screen);
+            }
+            if (wpe == null) return;
+            if (defs == null && !string.IsNullOrEmpty(mediaPath))
+            {
+                WallpaperEntry entry = WallpaperCatalog.TryLoadWallpaperDir(mediaPath);
+                if (entry != null) defs = entry.Properties;
+            }
+            wpe.SetProperties(WallpaperCatalog.ConvertPropsToTypedMap(overrides, defs));
         }
 
-        public void SetPreviewTarget(bool valkyrie)
+        public void ResetWallpaperProperties(ScreenId screen, List<WallpaperPropertyDef> defs)
         {
-            lock (_lock) { _previewValk = valkyrie; _dirtyPreview = true; }
+            var defaults = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (defs != null)
+            {
+                foreach (WallpaperPropertyDef d in defs)
+                    if (!string.IsNullOrEmpty(d.Key)) defaults[d.Key] = d.DefaultValue ?? "";
+            }
+            WallpaperFrameSource wpe;
+            lock (_lock)
+            {
+                LcdScene scene = Scene(screen);
+                scene.WallpaperProps.Clear();
+                wpe = scene.Source as WallpaperFrameSource;
+                MarkDirty(screen);
+            }
+            if (wpe != null && defaults.Count > 0)
+                wpe.SetProperties(WallpaperCatalog.ConvertPropsToTypedMap(defaults, defs));
+        }
+
+        public void SetBackgroundKind(ScreenId screen, BackgroundKind kind)
+        {
+            lock (_lock)
+            {
+                LcdScene scene = Scene(screen);
+                if (kind == BackgroundKind.None || kind == BackgroundKind.Color)
+                {
+                    ReplaceSourceLocked(scene, null);
+                    scene.MediaBytes = null; scene.MediaName = ""; scene.MediaPath = ""; scene.WallpaperType = "";
+                    scene.WallpaperProps.Clear();
+                }
+                scene.Background = kind;
+                MarkDirty(screen);
+            }
+        }
+
+        public void SetTargets(bool valkyrie, bool bowei, bool thermalright)
+        {
+            bool stopValk, stopBoWei, stopThermal;
+            lock (_lock)
+            {
+                stopValk = _targetValk && !valkyrie;
+                stopBoWei = _targetBoWei && !bowei;
+                stopThermal = _targetThermal && !thermalright;
+                _targetValk = valkyrie;
+                _targetBoWei = bowei;
+                _targetThermal = thermalright;
+                if (!valkyrie) _valkError = null; else _dirtyValk = true;
+                if (!bowei) _boweiError = null; else _dirtyBoWei = true;
+                if (!thermalright) _thermalError = null; else _dirtyThermal = true;
+            }
+            if (stopValk) try { ValkyrieDirectService.Stop(); } catch { }
+            if (stopBoWei) try { BoWeiDirectService.Stop(); } catch { }
+            if (stopThermal) try { ThermalrightDirectService.Stop(); } catch { }
+        }
+
+        public void SetPreviewTarget(ScreenId screen)
+        {
+            lock (_lock) { _previewScreen = screen; _dirtyPreview = true; }
         }
 
         public void SetPreviewEnabled(bool enabled)
@@ -321,14 +592,27 @@ namespace LcdFusion
             }
         }
 
-        public bool PreviewIsValkyrie { get { lock (_lock) { return _previewValk; } } }
+        public ScreenId PreviewScreen { get { lock (_lock) { return _previewScreen; } } }
 
-        public void StartStreaming() { _streaming = true; lock (_lock) { MarkDirty(true); MarkDirty(false); } Start(); }
+        public void StartStreaming()
+        {
+            _streaming = true;
+            lock (_lock)
+            {
+                _valkError = null; _boweiError = null; _thermalError = null;
+                MarkDirty(ScreenId.Valkyrie);
+                MarkDirty(ScreenId.BoWei);
+                MarkDirty(ScreenId.Thermalright);
+            }
+            Start();
+        }
 
         public void StopStreaming()
         {
             _streaming = false;
+            lock (_lock) { _valkError = null; _boweiError = null; _thermalError = null; }
             try { ValkyrieDirectService.Stop(); } catch { }
+            try { BoWeiDirectService.Stop(); } catch { }
             try { ThermalrightDirectService.Stop(); } catch { }
             Report(true, Loc.T("st.stopped"));
         }
@@ -339,17 +623,20 @@ namespace LcdFusion
 
         // ---- profiles ---------------------------------------------------------------
 
-        public ProfileData Capture(bool targetValk, bool targetThermal, bool activeValk)
+        public ProfileData Capture(bool targetValk, bool targetBoWei, bool targetThermal, ScreenId activeScreen)
         {
             lock (_lock)
             {
                 return new ProfileData
                 {
                     Valk = ToData(_valk),
+                    BoWei = ToData(_bowei),
                     Thermal = ToData(_thermal),
                     TargetValk = targetValk,
+                    TargetBoWei = targetBoWei,
                     TargetThermal = targetThermal,
-                    ActiveValk = activeValk,
+                    ActiveValk = activeScreen == ScreenId.Valkyrie,
+                    ActiveScreen = (int)activeScreen,
                     Streaming = _streaming
                 };
             }
@@ -358,16 +645,17 @@ namespace LcdFusion
         public void Apply(ProfileData p)
         {
             if (p == null) return;
-            ApplyScene(true, p.Valk);
-            ApplyScene(false, p.Thermal);
+            ApplyScene(ScreenId.Valkyrie, p.Valk);
+            if (p.BoWei != null) ApplyScene(ScreenId.BoWei, p.BoWei);
+            ApplyScene(ScreenId.Thermalright, p.Thermal);
         }
 
-        public void CopyScene(bool fromValkyrie, bool toValkyrie)
+        public void CopyScene(ScreenId from, ScreenId to)
         {
-            if (fromValkyrie == toValkyrie) return;
+            if (from == to) return;
             SceneData data;
-            lock (_lock) { data = ToData(fromValkyrie ? _valk : _thermal); }
-            ApplyScene(toValkyrie, data);
+            lock (_lock) { data = ToData(Scene(from)); }
+            ApplyScene(to, data);
         }
 
         private static SceneData ToData(LcdScene s)
@@ -376,15 +664,20 @@ namespace LcdFusion
             {
                 Background = (int)s.Background,
                 MediaPath = s.MediaPath,
-                MediaData = s.MediaBytes,
+                MediaData = s.Background == BackgroundKind.Wallpaper ? null : s.MediaBytes,
+                WallpaperType = s.WallpaperType ?? "",
                 BgColorArgb = s.BgColor.ToArgb(),
                 Rotation = s.Rotation,
                 FlipH = s.FlipH,
                 Scale = s.Scale,
+                ScaleX = s.ScaleX,
+                ScaleY = s.ScaleY,
                 PanX = s.PanX,
                 PanY = s.PanY,
                 Fit = (int)s.Fit
             };
+            foreach (KeyValuePair<string, string> kv in s.WallpaperProps)
+                d.WallpaperProps.Add(new WallpaperPropEntry { Key = kv.Key, Value = kv.Value ?? "" });
             foreach (Overlay o in s.Overlays)
                 d.Overlays.Add(new OverlayData
                 {
@@ -394,50 +687,94 @@ namespace LcdFusion
             return d;
         }
 
-        private void ApplyScene(bool valkyrie, SceneData d)
+        private void ApplyScene(ScreenId screen, SceneData d)
         {
             if (d == null) return;
             BackgroundKind bg = (BackgroundKind)d.Background;
-            byte[] data = d.MediaData;
-            Image img = null; GifState gif = null;
+            byte[] data = bg == BackgroundKind.Wallpaper ? null : d.MediaData;
+            IBackgroundSource source = null;
+            string mediaName = string.IsNullOrEmpty(d.MediaPath) ? "" : Path.GetFileName(d.MediaPath);
+            string wallpaperType = d.WallpaperType ?? "";
             try
             {
                 if (bg == BackgroundKind.Image && data != null && data.Length > 0)
-                    using (MemoryStream ms = new MemoryStream(data)) using (Image tmp = Image.FromStream(ms)) img = new Bitmap(tmp);
+                {
+                    using (MemoryStream ms = new MemoryStream(data))
+                    using (Image tmp = Image.FromStream(ms)) source = new StaticImageSource(new Bitmap(tmp));
+                }
                 else if (bg == BackgroundKind.Gif && data != null && data.Length > 0)
-                    gif = GifState.LoadBytes(data);
+                {
+                    source = GifState.LoadBytes(data);
+                }
                 else if (bg == BackgroundKind.Image && !string.IsNullOrEmpty(d.MediaPath) && File.Exists(d.MediaPath))
                 {
                     data = File.ReadAllBytes(d.MediaPath);
-                    using (MemoryStream ms = new MemoryStream(data)) using (Image tmp = Image.FromStream(ms)) img = new Bitmap(tmp);
+                    using (MemoryStream ms = new MemoryStream(data))
+                    using (Image tmp = Image.FromStream(ms)) source = new StaticImageSource(new Bitmap(tmp));
                 }
                 else if (bg == BackgroundKind.Gif && !string.IsNullOrEmpty(d.MediaPath) && File.Exists(d.MediaPath))
                 {
                     data = File.ReadAllBytes(d.MediaPath);
-                    gif = GifState.LoadBytes(data);
+                    source = GifState.LoadBytes(data);
                 }
-                else if (bg == BackgroundKind.Image || bg == BackgroundKind.Gif)
+                else if (bg == BackgroundKind.Wallpaper && !string.IsNullOrEmpty(d.MediaPath) && Directory.Exists(d.MediaPath))
+                {
+                    WallpaperEntry entry = WallpaperCatalog.TryLoadWallpaperDir(d.MediaPath);
+                    string rendererExe = ResolvedWallpaperRendererPath();
+                    if (entry != null && !string.IsNullOrEmpty(rendererExe))
+                    {
+                        int cw, ch;
+                        CanvasSize(screen, out cw, out ch);
+                        int fps;
+                        lock (_lock) { fps = Scene(screen).TargetRendererFps(screen); }
+                        var propStrings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        if (d.WallpaperProps != null)
+                        {
+                            foreach (WallpaperPropEntry pe in d.WallpaperProps)
+                                if (pe != null && !string.IsNullOrEmpty(pe.Key)) propStrings[pe.Key] = pe.Value ?? "";
+                        }
+                        Dictionary<string, object> typedProps = WallpaperCatalog.ConvertPropsToTypedMap(propStrings, entry.Properties);
+                        source = new WallpaperFrameSource(screen, rendererExe, entry.Directory, ResolvedWallpaperAssetsDir(), cw, ch, fps, typedProps);
+                        mediaName = entry.DisplayTitle;
+                        wallpaperType = entry.Type ?? "scene";
+                    }
+                    else
+                    {
+                        bg = BackgroundKind.None;
+                    }
+                }
+                else if (bg == BackgroundKind.Image || bg == BackgroundKind.Gif || bg == BackgroundKind.Wallpaper)
+                {
                     bg = BackgroundKind.None;
+                }
             }
-            catch { bg = BackgroundKind.None; img = null; gif = null; data = null; }
+            catch { bg = BackgroundKind.None; source = null; data = null; }
 
+            SensorReading snapSensors = null;
             lock (_lock)
             {
-                LcdScene s = valkyrie ? _valk : _thermal;
-                s.DisposeSources();
-                s.ImageSource = img;
-                s.Gif = gif;
+                LcdScene s = Scene(screen);
+                ReplaceSourceLocked(s, source);
                 s.MediaBytes = data;
                 s.Background = bg;
                 s.MediaPath = d.MediaPath ?? "";
-                s.MediaName = string.IsNullOrEmpty(d.MediaPath) ? "" : Path.GetFileName(d.MediaPath);
+                s.MediaName = mediaName;
+                s.WallpaperType = wallpaperType;
+                s.WallpaperProps.Clear();
+                if (bg == BackgroundKind.Wallpaper && d.WallpaperProps != null)
+                {
+                    foreach (WallpaperPropEntry pe in d.WallpaperProps)
+                        if (pe != null && !string.IsNullOrEmpty(pe.Key)) s.WallpaperProps[pe.Key] = pe.Value ?? "";
+                }
                 s.BgColor = Color.FromArgb(d.BgColorArgb);
                 s.Rotation = d.Rotation;
                 s.FlipH = d.FlipH;
                 s.Scale = d.Scale <= 0 ? 1.0 : d.Scale;
+                s.ScaleX = d.ScaleX <= 0 ? 1.0 : d.ScaleX;
+                s.ScaleY = d.ScaleY <= 0 ? 1.0 : d.ScaleY;
                 s.PanX = d.PanX;
                 s.PanY = d.PanY;
-                s.Fit = (FitMode)d.Fit;
+                s.Fit = Enum.IsDefined(typeof(FitMode), d.Fit) ? (FitMode)d.Fit : FitMode.Fit;
                 s.Overlays.Clear();
                 if (d.Overlays != null)
                     foreach (OverlayData od in d.Overlays)
@@ -446,13 +783,23 @@ namespace LcdFusion
                             Kind = (OverlayKind)od.Kind, Text = od.Text, X = od.X, Y = od.Y,
                             Size = od.Size, Rotation = od.Rotation, Color = Color.FromArgb(od.ColorArgb), ShowLabel = od.ShowLabel
                         });
-                MarkDirty(valkyrie);
+                if (s.IsWebWallpaper() && _sensors != null && _sensors.Available)
+                    snapSensors = _sensors;
+                MarkDirty(screen);
             }
+            WallpaperFrameSource wpeSource = source as WallpaperFrameSource;
+            if (snapSensors != null && wpeSource != null)
+                wpeSource.SetSensors(BuildSensorPayload(snapSensors));
         }
 
-        private void MarkDirty(bool valkyrie)
+        private void MarkDirty(ScreenId screen)
         {
-            if (valkyrie) _dirtyValk = true; else _dirtyThermal = true;
+            switch (screen)
+            {
+                case ScreenId.BoWei: _dirtyBoWei = true; break;
+                case ScreenId.Thermalright: _dirtyThermal = true; break;
+                default: _dirtyValk = true; break;
+            }
             _dirtyPreview = true;
         }
 
@@ -460,7 +807,7 @@ namespace LcdFusion
 
         private void Loop()
         {
-            long lastValk = 0, lastThermal = 0, lastPreview = 0, lastSensor = 0;
+            long lastValk = 0, lastBoWei = 0, lastThermal = 0, lastPreview = 0, lastSensor = 0;
             long lastTick = Environment.TickCount;
 
             while (_alive)
@@ -470,39 +817,70 @@ namespace LcdFusion
                 lastTick = now;
 
                 bool needSensors;
-                lock (_lock) { needSensors = _valk.NeedsSensorData() || _thermal.NeedsSensorData(); }
-                if (needSensors && now - lastSensor >= 1000)
+                lock (_lock) { needSensors = _valk.NeedsSensorData() || _bowei.NeedsSensorData() || _thermal.NeedsSensorData(); }
+                if (needSensors && (lastSensor == 0 || now - lastSensor >= 1000))
                 {
                     SensorReading r = SensorService.Read();
+                    Dictionary<string, object> webPayload = BuildSensorPayload(r);
+                    WallpaperFrameSource vWpe = null, bWpe = null, tWpe = null;
                     lock (_lock)
                     {
                         _sensors = r;
                         if (_valk.NeedsSensorData()) _dirtyValk = true;
+                        if (_bowei.NeedsSensorData()) _dirtyBoWei = true;
                         if (_thermal.NeedsSensorData()) _dirtyThermal = true;
-                        if ((_previewValk ? _valk : _thermal).NeedsSensorData()) _dirtyPreview = true;
+                        if (Scene(_previewScreen).NeedsSensorData()) _dirtyPreview = true;
+                        if (_valk.IsWebWallpaper()) vWpe = _valk.Source as WallpaperFrameSource;
+                        if (_bowei.IsWebWallpaper()) bWpe = _bowei.Source as WallpaperFrameSource;
+                        if (_thermal.IsWebWallpaper()) tWpe = _thermal.Source as WallpaperFrameSource;
                     }
+                    if (vWpe != null) vWpe.SetSensors(webPayload);
+                    if (bWpe != null) bWpe.SetSensors(webPayload);
+                    if (tWpe != null) tWpe.SetSensors(webPayload);
                     lastSensor = now;
                 }
 
                 lock (_lock)
                 {
-                    if (_valk.Gif != null) _valk.Gif.Advance(delta);
-                    if (_thermal.Gif != null) _thermal.Gif.Advance(delta);
+                    DrainPendingDisposeLocked();
+                    if (_valk.Source != null) _valk.Source.Advance(delta);
+                    if (_bowei.Source != null) _bowei.Source.Advance(delta);
+                    if (_thermal.Source != null) _thermal.Source.Advance(delta);
                 }
 
-                int valkInterval, thermalInterval, previewInterval;
-                bool previewValk, previewEnabled, streaming, tv, tt;
+                int valkInterval, boweiInterval, thermalInterval, previewInterval;
+                ScreenId previewScreen;
+                bool previewEnabled, streaming, tv, tb, tt;
+                WallpaperFrameSource valkWpe, boweiWpe, thermalWpe;
+                int valkFps, boweiFps, thermalFps;
+                FitMode valkFit, boweiFit, thermalFit;
                 lock (_lock)
                 {
-                    valkInterval = _valk.StreamIntervalMs(true);
-                    thermalInterval = _thermal.StreamIntervalMs(false);
-                    previewValk = _previewValk; previewEnabled = _previewEnabled; streaming = _streaming; tv = _targetValk; tt = _targetThermal;
-                    previewInterval = (previewValk ? _valk : _thermal).PreviewIntervalMs();
+                    valkInterval = _valk.StreamIntervalMs(ScreenId.Valkyrie);
+                    boweiInterval = _bowei.StreamIntervalMs(ScreenId.BoWei);
+                    thermalInterval = _thermal.StreamIntervalMs(ScreenId.Thermalright);
+                    previewScreen = _previewScreen; previewEnabled = _previewEnabled; streaming = _streaming;
+                    tv = _targetValk; tb = _targetBoWei; tt = _targetThermal;
+                    previewInterval = Scene(previewScreen).PreviewIntervalMs();
+                    valkWpe = _valk.Source as WallpaperFrameSource;
+                    boweiWpe = _bowei.Source as WallpaperFrameSource;
+                    thermalWpe = _thermal.Source as WallpaperFrameSource;
+                    valkFps = _valk.TargetRendererFps(ScreenId.Valkyrie);
+                    boweiFps = _bowei.TargetRendererFps(ScreenId.BoWei);
+                    thermalFps = _thermal.TargetRendererFps(ScreenId.Thermalright);
+                    valkFit = _valk.Fit;
+                    boweiFit = _bowei.Fit;
+                    thermalFit = _thermal.Fit;
                 }
+
+                SyncWallpaperSource(ScreenId.Valkyrie, valkWpe, (streaming && tv) || (previewEnabled && previewScreen == ScreenId.Valkyrie), valkFps, valkFit);
+                SyncWallpaperSource(ScreenId.BoWei, boweiWpe, (streaming && tb) || (previewEnabled && previewScreen == ScreenId.BoWei), boweiFps, boweiFit);
+                SyncWallpaperSource(ScreenId.Thermalright, thermalWpe, (streaming && tt) || (previewEnabled && previewScreen == ScreenId.Thermalright), thermalFps, thermalFit);
+                SyncWallpaperErrors(valkWpe, boweiWpe, thermalWpe, streaming, tv, tb, tt, previewEnabled, previewScreen);
 
                 if (previewEnabled && (_dirtyPreview || ShouldRefresh(now, lastPreview, previewInterval)))
                 {
-                    RenderPreview(previewValk);
+                    RenderPreview(previewScreen);
                     lastPreview = now;
                     _dirtyPreview = false;
                 }
@@ -511,11 +889,82 @@ namespace LcdFusion
                 {
                     if (tv && (_dirtyValk || ShouldRefresh(now, lastValk, valkInterval)))
                     { PushValkyrie(); lastValk = now; _dirtyValk = false; }
+                    if (tb && (_dirtyBoWei || ShouldRefresh(now, lastBoWei, boweiInterval)))
+                    { PushBoWei(); lastBoWei = now; _dirtyBoWei = false; }
                     if (tt && (_dirtyThermal || ShouldRefresh(now, lastThermal, thermalInterval)))
                     { PushThermalright(); lastThermal = now; _dirtyThermal = false; }
                 }
 
                 Thread.Sleep(15);
+            }
+        }
+
+        private static Dictionary<string, object> BuildSensorPayload(SensorReading r)
+        {
+            if (r == null) r = new SensorReading();
+            var cpu = new Dictionary<string, object>
+            {
+                { "name", r.CpuName ?? "" },
+                { "hasTemp", r.HasCpuTemp },
+                { "tempC", Math.Round(r.CpuTempC, 1) },
+                { "hasLoad", r.HasCpuLoad },
+                { "load", Math.Round(r.CpuLoad, 1) },
+                { "hasClock", r.HasCpuClock },
+                { "clockMhz", Math.Round(r.CpuClockMhz, 0) },
+                { "hasPower", r.HasCpuPower },
+                { "powerW", Math.Round(r.CpuPowerW, 1) },
+                { "coreLoads", r.CpuCoreLoads != null ? Array.ConvertAll(r.CpuCoreLoads, v => Math.Round(v, 1)) : new double[0] }
+            };
+            var gpu = new Dictionary<string, object>
+            {
+                { "name", r.GpuName ?? "" },
+                { "hasTemp", r.HasGpuTemp },
+                { "tempC", Math.Round(r.GpuTempC, 1) },
+                { "hasHotSpot", r.HasGpuHotSpot },
+                { "hotSpotC", Math.Round(r.GpuHotSpotC, 1) },
+                { "hasLoad", r.HasGpuLoad },
+                { "load", Math.Round(r.GpuLoad, 1) },
+                { "hasClock", r.HasGpuClock },
+                { "clockMhz", Math.Round(r.GpuClockMhz, 0) },
+                { "hasMemClock", r.HasGpuMemClock },
+                { "memClockMhz", Math.Round(r.GpuMemClockMhz, 0) },
+                { "hasPower", r.HasGpuPower },
+                { "powerW", Math.Round(r.GpuPowerW, 1) },
+                { "hasVram", r.HasGpuVram },
+                { "vramUsedMb", Math.Round(r.GpuVramUsedMb, 0) },
+                { "vramTotalMb", Math.Round(r.GpuVramTotalMb, 0) },
+                { "hasFan", r.HasGpuFan },
+                { "fanRpm", Math.Round(r.GpuFanRpm, 0) },
+                { "hasFanPct", r.HasGpuFanPct },
+                { "fanPct", Math.Round(r.GpuFanPct, 0) }
+            };
+            var ram = new Dictionary<string, object>
+            {
+                { "hasLoad", r.HasRamLoad },
+                { "load", Math.Round(r.RamLoad, 1) },
+                { "usedGb", Math.Round(r.RamUsedGb, 2) },
+                { "totalGb", Math.Round(r.RamTotalGb, 2) }
+            };
+            return new Dictionary<string, object>
+            {
+                { "available", r.Available },
+                { "source", r.Source ?? "" },
+                { "timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() },
+                { "cpu", cpu },
+                { "gpu", gpu },
+                { "ram", ram }
+            };
+        }
+
+        private void SyncWallpaperSource(ScreenId screen, WallpaperFrameSource wpe, bool active, int targetFps, FitMode fit)
+        {
+            if (wpe == null) return;
+            wpe.SetPaused(!active);
+            if (active)
+            {
+                int cw, ch;
+                CanvasSize(screen, out cw, out ch);
+                wpe.EnsureSizeAndFps(cw, ch, targetFps, fit);
             }
         }
 
@@ -528,38 +977,138 @@ namespace LcdFusion
         {
             try
             {
-                using (Bitmap bmp = RenderScene(true, ValkyrieDirectService.Width, ValkyrieDirectService.Height))
+                int wireW = ValkyrieDirectService.Width;
+                int wireH = ValkyrieDirectService.Height;
+                int rot = EffectiveRotation(ScreenId.Valkyrie);
+                int canvasW = (rot == 90 || rot == 270) ? wireH : wireW;
+                int canvasH = (rot == 90 || rot == 270) ? wireW : wireH;
+                using (Bitmap bmp = RenderScene(ScreenId.Valkyrie, canvasW, canvasH))
                 {
-                    DirectSendResult result = ValkyrieDirectService.ShowBgra(BgraFromBitmap(bmp));
-                    Report(result.Success, result.Success ? Loc.T("st.active") : "Valkyrie: " + result.Message);
+                    ApplyHardwareRotation(bmp, rot);
+                    DirectSendResult result = ValkyrieDirectService.ShowBgra(BgraFromBitmap(bmp), wireW, wireH);
+                    RecordScreenStatus(ScreenId.Valkyrie, result.Success ? null : "Valkyrie: " + result.Message);
                 }
             }
-            catch (Exception ex) { Report(false, "Valkyrie: " + ex.Message); }
+            catch (Exception ex) { RecordScreenStatus(ScreenId.Valkyrie, "Valkyrie: " + ex.Message); }
+        }
+
+        private void PushBoWei()
+        {
+            try
+            {
+                int wireW = BoWeiDirectService.Width;
+                int wireH = BoWeiDirectService.Height;
+                int rot = EffectiveRotation(ScreenId.BoWei);
+                int canvasW = (rot == 90 || rot == 270) ? wireH : wireW;
+                int canvasH = (rot == 90 || rot == 270) ? wireW : wireH;
+                using (Bitmap bmp = RenderScene(ScreenId.BoWei, canvasW, canvasH))
+                {
+                    ApplyHardwareRotation(bmp, rot);
+                    DirectSendResult result = BoWeiDirectService.ShowBgra(BgraFromBitmap(bmp), wireW, wireH);
+                    RecordScreenStatus(ScreenId.BoWei, result.Success ? null : "BoWei: " + result.Message);
+                }
+            }
+            catch (Exception ex) { RecordScreenStatus(ScreenId.BoWei, "BoWei: " + ex.Message); }
         }
 
         private void PushThermalright()
         {
             try
             {
-                using (Bitmap bmp = RenderScene(false, ThermalrightDirectService.CanvasWidth, ThermalrightDirectService.CanvasHeight))
+                int wireW = ThermalrightDirectService.CanvasWidth;
+                int wireH = ThermalrightDirectService.CanvasHeight;
+                int rot = EffectiveRotation(ScreenId.Thermalright);
+                int canvasW = (rot == 90 || rot == 270) ? wireH : wireW;
+                int canvasH = (rot == 90 || rot == 270) ? wireW : wireH;
+                using (Bitmap bmp = RenderScene(ScreenId.Thermalright, canvasW, canvasH))
                 {
+                    ApplyHardwareRotation(bmp, rot);
                     DirectSendResult result = ThermalrightDirectService.ShowBitmap(bmp);
-                    Report(result.Success, result.Success ? Loc.T("st.active") : "Thermalright: " + result.Message);
+                    RecordScreenStatus(ScreenId.Thermalright, result.Success ? null : "Thermalright: " + result.Message);
                 }
             }
-            catch (Exception ex) { Report(false, "Thermalright: " + ex.Message); }
+            catch (Exception ex) { RecordScreenStatus(ScreenId.Thermalright, "Thermalright: " + ex.Message); }
         }
 
-        private void RenderPreview(bool valkyrie)
+        private void RecordScreenStatus(ScreenId screen, string error)
+        {
+            lock (_lock)
+            {
+                switch (screen)
+                {
+                    case ScreenId.BoWei: _boweiError = error; break;
+                    case ScreenId.Thermalright: _thermalError = error; break;
+                    default: _valkError = error; break;
+                }
+            }
+            PublishCombinedStatus();
+        }
+
+        private void SyncWallpaperErrors(
+            WallpaperFrameSource valkWpe,
+            WallpaperFrameSource boweiWpe,
+            WallpaperFrameSource thermalWpe,
+            bool streaming, bool tv, bool tb, bool tt,
+            bool previewEnabled, ScreenId previewScreen)
+        {
+            bool valkActive = (streaming && tv) || (previewEnabled && previewScreen == ScreenId.Valkyrie);
+            bool boweiActive = (streaming && tb) || (previewEnabled && previewScreen == ScreenId.BoWei);
+            bool thermalActive = (streaming && tt) || (previewEnabled && previewScreen == ScreenId.Thermalright);
+
+            string nextValk = (valkActive && valkWpe != null && !string.IsNullOrEmpty(valkWpe.StatusError)) ? "Valkyrie: " + valkWpe.StatusError : null;
+            string nextBoWei = (boweiActive && boweiWpe != null && !string.IsNullOrEmpty(boweiWpe.StatusError)) ? "BoWei: " + boweiWpe.StatusError : null;
+            string nextThermal = (thermalActive && thermalWpe != null && !string.IsNullOrEmpty(thermalWpe.StatusError)) ? "Thermalright: " + thermalWpe.StatusError : null;
+
+            bool changed;
+            lock (_lock)
+            {
+                changed = !string.Equals(_valkWpeError, nextValk, StringComparison.Ordinal)
+                       || !string.Equals(_boweiWpeError, nextBoWei, StringComparison.Ordinal)
+                       || !string.Equals(_thermalWpeError, nextThermal, StringComparison.Ordinal);
+                if (changed)
+                {
+                    _valkWpeError = nextValk;
+                    _boweiWpeError = nextBoWei;
+                    _thermalWpeError = nextThermal;
+                }
+            }
+
+            if (changed) PublishCombinedStatus();
+        }
+
+        private void PublishCombinedStatus()
+        {
+            string combined = null;
+            bool isStreaming;
+            lock (_lock)
+            {
+                isStreaming = _streaming;
+                var errors = new List<string>(6);
+                if (_targetValk && !string.IsNullOrEmpty(_valkError)) errors.Add(_valkError);
+                if (_targetBoWei && !string.IsNullOrEmpty(_boweiError)) errors.Add(_boweiError);
+                if (_targetThermal && !string.IsNullOrEmpty(_thermalError)) errors.Add(_thermalError);
+                if (!string.IsNullOrEmpty(_valkWpeError)) errors.Add(_valkWpeError);
+                if (!string.IsNullOrEmpty(_boweiWpeError)) errors.Add(_boweiWpeError);
+                if (!string.IsNullOrEmpty(_thermalWpeError)) errors.Add(_thermalWpeError);
+                if (errors.Count > 0) combined = string.Join(" | ", errors);
+            }
+
+            if (string.IsNullOrEmpty(combined))
+                Report(true, isStreaming ? Loc.T("st.active") : Loc.T("st.ready"));
+            else
+                Report(false, combined);
+        }
+
+        private void RenderPreview(ScreenId screen)
         {
             try
             {
-                int nativeW = valkyrie ? ValkyrieDirectService.Width : ThermalrightDirectService.CanvasWidth;
-                int nativeH = valkyrie ? ValkyrieDirectService.Height : ThermalrightDirectService.CanvasHeight;
-                double sc = Math.Min(1.0, 768.0 / nativeW);
-                int w = Math.Max(1, (int)Math.Round(nativeW * sc));
-                int h = Math.Max(1, (int)Math.Round(nativeH * sc));
-                using (Bitmap bmp = RenderScene(valkyrie, w, h))
+                int canvasW, canvasH;
+                CanvasSize(screen, out canvasW, out canvasH);
+                double sc = Math.Min(1.0, Math.Min(768.0 / canvasW, 768.0 / canvasH));
+                int w = Math.Max(1, (int)Math.Round(canvasW * sc));
+                int h = Math.Max(1, (int)Math.Round(canvasH * sc));
+                using (Bitmap bmp = RenderScene(screen, w, h))
                 using (MemoryStream stream = new MemoryStream())
                 {
                     bmp.Save(stream, ImageFormat.Png);
@@ -576,22 +1125,30 @@ namespace LcdFusion
         private static readonly Color BgBottom = Color.FromArgb(20, 27, 45);
         private static readonly Color Muted = Color.FromArgb(150, 165, 190);
 
-        private Bitmap RenderScene(bool valkyrie, int w, int h)
+        private Bitmap RenderScene(ScreenId screen, int w, int h)
         {
             // Snapshot scene fields + overlay copies under lock, then render unlocked.
-            BackgroundKind bg; Color bgColor; Image img = null; Image gifFrame = null;
-            double rotation; bool flip; double scale, panX, panY; FitMode fit;
+            // Because old IBackgroundSource instances are disposed only on the Loop thread,
+            // the captured source reference remains valid for the duration of this render call.
+            BackgroundKind bg; Color bgColor; IBackgroundSource bgSource;
+            double rotation; bool flip; double scale, scaleX, scaleY, panX, panY; FitMode fit;
             List<Overlay> overlays = new List<Overlay>();
             SensorReading sensors;
             lock (_lock)
             {
-                LcdScene scene = valkyrie ? _valk : _thermal;
+                LcdScene scene = Scene(screen);
                 bg = scene.Background; bgColor = scene.BgColor;
-                rotation = scene.Rotation; flip = scene.FlipH; scale = scene.Scale; panX = scene.PanX; panY = scene.PanY; fit = scene.Fit;
-                if (bg == BackgroundKind.Image) img = scene.ImageSource;
-                else if (bg == BackgroundKind.Gif && scene.Gif != null) gifFrame = scene.Gif.CurrentFrame();
+                rotation = scene.Rotation; flip = scene.FlipH; scale = scene.Scale; scaleX = scene.ScaleX; scaleY = scene.ScaleY; panX = scene.PanX; panY = scene.PanY; fit = scene.Fit;
+                bgSource = (bg == BackgroundKind.Image || bg == BackgroundKind.Gif || bg == BackgroundKind.Wallpaper) ? scene.Source : null;
                 foreach (Overlay o in scene.Overlays) overlays.Add(o.Clone());
                 sensors = _sensors;
+            }
+
+            Image sourceFrame = null;
+            if (bgSource != null)
+            {
+                sourceFrame = bgSource.AcquireFrame();
+                bgSource.MarkFrameConsumed();
             }
 
             Bitmap bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
@@ -608,8 +1165,7 @@ namespace LcdFusion
                     using (LinearGradientBrush b = new LinearGradientBrush(new Rectangle(0, 0, w, h), BgTop, BgBottom, 90f))
                         g.FillRectangle(b, 0, 0, w, h);
 
-                Image source = img != null ? img : gifFrame;
-                if (source != null) DrawTransformed(g, source, w, h, rotation, flip, scale, panX, panY, fit);
+                if (sourceFrame != null) DrawTransformed(g, sourceFrame, w, h, rotation, flip, scale, scaleX, scaleY, panX, panY, fit);
 
                 foreach (Overlay o in overlays) DrawOverlay(g, o, sensors, w, h);
             }
@@ -617,14 +1173,26 @@ namespace LcdFusion
         }
 
         private static void DrawTransformed(Graphics g, Image src, int w, int h, double rotation, bool flip,
-                                            double scale, double panX, double panY, FitMode fit)
+                                            double scale, double scaleX, double scaleY, double panX, double panY, FitMode fit)
         {
-            double baseScale = fit == FitMode.Fill
-                ? Math.Max((double)w / src.Width, (double)h / src.Height)
-                : Math.Min((double)w / src.Width, (double)h / src.Height);
-            double sc = baseScale * (scale <= 0 ? 0.01 : scale);
-            float dw = (float)(src.Width * sc);
-            float dh = (float)(src.Height * sc);
+            double userScale = scale <= 0 ? 0.01 : scale;
+            float dw, dh;
+            if (fit == FitMode.Stretch)
+            {
+                double sx = scaleX <= 0 ? 1.0 : scaleX;
+                double sy = scaleY <= 0 ? 1.0 : scaleY;
+                dw = (float)(w * userScale * sx);
+                dh = (float)(h * userScale * sy);
+            }
+            else
+            {
+                double baseScale = fit == FitMode.Fill
+                    ? Math.Max((double)w / src.Width, (double)h / src.Height)
+                    : Math.Min((double)w / src.Width, (double)h / src.Height);
+                double sc = baseScale * userScale;
+                dw = (float)(src.Width * sc);
+                dh = (float)(src.Height * sc);
+            }
 
             GraphicsState state = g.Save();
             g.TranslateTransform((float)(w / 2.0 + panX * w), (float)(h / 2.0 + panY * h));
