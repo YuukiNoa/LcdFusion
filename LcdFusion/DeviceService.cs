@@ -22,6 +22,7 @@ namespace LcdFusion
     internal sealed class DeviceSnapshot
     {
         public DeviceInfo Valkyrie;
+        public DeviceInfo BoWei;
         public DeviceInfo Thermalright;
         public bool DescriptorFailure;
         public DateTime CheckedAt;
@@ -30,6 +31,7 @@ namespace LcdFusion
     internal static class DeviceService
     {
         private const string ValkyrieId = "VID_345F&PID_9132";
+        private const string BoWeiId = "VID_374A&PID_A005";
         private const string ThermalrightId = "VID_0416&PID_5408";
 
         public static DeviceSnapshot Read()
@@ -37,6 +39,7 @@ namespace LcdFusion
             var snapshot = new DeviceSnapshot();
             snapshot.CheckedAt = DateTime.Now;
             snapshot.Valkyrie = Empty("Valkyrie", "345F:9132");
+            snapshot.BoWei = Empty("BoWei", "374A:A005");
             snapshot.Thermalright = Empty("Thermalright", "0416:5408");
 
             try
@@ -53,11 +56,14 @@ namespace LcdFusion
 
                         if (Contains(id, ValkyrieId))
                             Update(snapshot.Valkyrie, id, name, code);
+                        if (Contains(id, BoWeiId))
+                            Update(snapshot.BoWei, id, name, code);
                         if (Contains(id, ThermalrightId))
                             Update(snapshot.Thermalright, id, name, code);
                         if (Contains(id, "VID_0000&PID_0002") ||
                             Contains(name, "descrittore dispositivo non riuscita") ||
-                            Contains(name, "Device Descriptor Request Failed"))
+                            Contains(name, "Device Descriptor Request Failed") ||
+                            Contains(name, "设备描述符请求失败"))
                             snapshot.DescriptorFailure = true;
                     }
                 }
@@ -91,7 +97,9 @@ namespace LcdFusion
 
             // Prefer the actual display interface over the composite/HID children.
             if (string.IsNullOrEmpty(target.WindowsName) ||
-                Contains(name, "Display") || Contains(name, "USBDISPLAY"))
+                target.WindowsName == "Dispositivo non disponibile" ||
+                Contains(name, "Display") || Contains(name, "USBDISPLAY") ||
+                Contains(name, "Vk-Copl") || Contains(name, "WinUsb"))
                 target.WindowsName = name;
         }
 
