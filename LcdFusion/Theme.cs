@@ -1,5 +1,9 @@
+using System;
+using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Interop;
 using System.Windows.Markup;
+using System.Windows.Shell;
 
 namespace LcdFusion
 {
@@ -7,9 +11,79 @@ namespace LcdFusion
     // (single-quoted attributes so it embeds cleanly) and parsed at startup.
     internal static class Theme
     {
+        private const int DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19;
+        private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+        private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+        private const int DWMWA_BORDER_COLOR = 34;
+        private const int DWMWA_CAPTION_COLOR = 35;
+        private const int DWMWA_TEXT_COLOR = 36;
+        private const int DWMWCP_ROUND = 2;
+
+        // Win32 COLORREF is 0x00BBGGRR
+        private const int CaptionBgColorRef = 0x00150D0A;   // #0A0D15
+        private const int CaptionTextColorRef = 0x00F7F0EC; // #ECF0F7
+        private const int BorderColorRef = 0x0040271E;      // #1E2740
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
         public static ResourceDictionary Build()
         {
             return (ResourceDictionary)XamlReader.Parse(Xaml);
+        }
+
+        public static void ApplyDarkTitleBar(Window window)
+        {
+            if (window == null) return;
+            Action apply = () => ApplyDarkTitleBarNow(window);
+            IntPtr hwnd = new WindowInteropHelper(window).Handle;
+            if (hwnd != IntPtr.Zero)
+            {
+                apply();
+                return;
+            }
+            window.SourceInitialized += delegate { apply(); };
+        }
+
+        public static void ApplyCustomChrome(Window window)
+        {
+            if (window == null) return;
+            var chrome = new WindowChrome
+            {
+                CaptionHeight = 36,
+                ResizeBorderThickness = new Thickness(6),
+                GlassFrameThickness = new Thickness(0, 0, 0, 1),
+                CornerRadius = new CornerRadius(0),
+                UseAeroCaptionButtons = false
+            };
+            WindowChrome.SetWindowChrome(window, chrome);
+            ApplyDarkTitleBar(window);
+        }
+
+        private static void ApplyDarkTitleBarNow(Window window)
+        {
+            try
+            {
+                IntPtr hwnd = new WindowInteropHelper(window).Handle;
+                if (hwnd == IntPtr.Zero) return;
+
+                int dark = 1;
+                if (DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref dark, sizeof(int)) != 0)
+                    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1, ref dark, sizeof(int));
+
+                int corner = DWMWCP_ROUND;
+                DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ref corner, sizeof(int));
+
+                int border = BorderColorRef;
+                DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, ref border, sizeof(int));
+
+                int caption = CaptionBgColorRef;
+                DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, ref caption, sizeof(int));
+
+                int text = CaptionTextColorRef;
+                DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, ref text, sizeof(int));
+            }
+            catch { }
         }
 
         private const string Xaml = @"
@@ -104,6 +178,57 @@ namespace LcdFusion
     <Style.Triggers>
       <Trigger Property='IsMouseOver' Value='True'><Setter Property='Foreground' Value='{StaticResource Text}'/></Trigger>
     </Style.Triggers>
+  </Style>
+
+  <Style x:Key='WinCaptionBtn' TargetType='Button'>
+    <Setter Property='Width' Value='46'/>
+    <Setter Property='Height' Value='36'/>
+    <Setter Property='Background' Value='Transparent'/>
+    <Setter Property='Foreground' Value='{StaticResource Muted}'/>
+    <Setter Property='BorderThickness' Value='0'/>
+    <Setter Property='FontSize' Value='11'/>
+    <Setter Property='Focusable' Value='False'/>
+    <Setter Property='Cursor' Value='Hand'/>
+    <Setter Property='Template'>
+      <Setter.Value>
+        <ControlTemplate TargetType='Button'>
+          <Border x:Name='bd' Background='{TemplateBinding Background}' SnapsToDevicePixels='True'>
+            <ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center' TextElement.Foreground='{TemplateBinding Foreground}'/>
+          </Border>
+          <ControlTemplate.Triggers>
+            <Trigger Property='IsMouseOver' Value='True'>
+              <Setter TargetName='bd' Property='Background' Value='{StaticResource Surface2}'/>
+              <Setter Property='Foreground' Value='{StaticResource Text}'/>
+            </Trigger>
+            <Trigger Property='IsPressed' Value='True'>
+              <Setter TargetName='bd' Property='Background' Value='{StaticResource Hover}'/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+
+  <Style x:Key='WinCloseBtn' TargetType='Button' BasedOn='{StaticResource WinCaptionBtn}'>
+    <Setter Property='Template'>
+      <Setter.Value>
+        <ControlTemplate TargetType='Button'>
+          <Border x:Name='bd' Background='{TemplateBinding Background}' SnapsToDevicePixels='True'>
+            <ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center' TextElement.Foreground='{TemplateBinding Foreground}'/>
+          </Border>
+          <ControlTemplate.Triggers>
+            <Trigger Property='IsMouseOver' Value='True'>
+              <Setter TargetName='bd' Property='Background' Value='#D94452'/>
+              <Setter Property='Foreground' Value='#FFFFFF'/>
+            </Trigger>
+            <Trigger Property='IsPressed' Value='True'>
+              <Setter TargetName='bd' Property='Background' Value='#B83240'/>
+              <Setter Property='Foreground' Value='#FFFFFF'/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
   </Style>
 
   <!-- Slider -->
