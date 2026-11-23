@@ -60,7 +60,7 @@ Profiles and settings are stored under `%APPDATA%\LcdFusion\` (`profiles\*.xml`,
 
 ## Build from source
 
-SDK‑style project targeting **.NET Framework 4.8** (WPF + Windows Forms, x86). With the [.NET SDK](https://dotnet.microsoft.com/download) installed:
+SDK‑style project targeting **.NET Framework 4.8** (WPF + Windows Forms, x64). With the [.NET SDK](https://dotnet.microsoft.com/download) installed:
 
 ```powershell
 dotnet build LcdFusion/LcdFusion.csproj -c Release
