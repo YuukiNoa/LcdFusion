@@ -13,6 +13,7 @@ namespace LcdFusion
         public string Source = "Nessuna sorgente";
 
         // CPU
+        public string CpuName = "";
         public bool HasCpuTemp; public double CpuTempC;
         public bool HasCpuLoad; public double CpuLoad;
         public bool HasCpuClock; public double CpuClockMhz;
@@ -22,11 +23,14 @@ namespace LcdFusion
         // GPU (primary / discrete)
         public string GpuName = "";
         public bool HasGpuTemp; public double GpuTempC;
+        public bool HasGpuHotSpot; public double GpuHotSpotC;
         public bool HasGpuLoad; public double GpuLoad;
         public bool HasGpuClock; public double GpuClockMhz;
+        public bool HasGpuMemClock; public double GpuMemClockMhz;
         public bool HasGpuPower; public double GpuPowerW;
         public bool HasGpuVram; public double GpuVramUsedMb; public double GpuVramTotalMb;
         public bool HasGpuFan; public double GpuFanRpm;
+        public bool HasGpuFanPct; public double GpuFanPct;
 
         // RAM
         public bool HasRamLoad; public double RamLoad; public double RamUsedGb; public double RamTotalGb;
@@ -120,40 +124,62 @@ namespace LcdFusion
 
         private static void ReadCpu(IHardware cpu, SensorReading r)
         {
-            List<KeyValuePair<int, double>> cores = new List<KeyValuePair<int, double>>();
+            r.CpuName = cpu.Name ?? "";
+            Dictionary<int, double> coreSum = new Dictionary<int, double>();
+            Dictionary<int, int> coreCnt = new Dictionary<int, int>();
             double bestTemp = double.NaN; int bestTempScore = int.MinValue;
             double maxClock = double.NaN;
+            double bestPower = double.NaN; int bestPowerScore = int.MinValue;
             foreach (ISensor s in cpu.Sensors)
             {
                 if (s.Value == null) continue;
                 double v = (double)s.Value.Value;
+                if (double.IsNaN(v) || double.IsInfinity(v)) continue;
                 string low = (s.Name ?? "").ToLowerInvariant();
                 switch (s.SensorType)
                 {
                     case SensorType.Temperature:
+                        if (low.Contains("distance") || low.Contains("tjmax")) break;
                         int sc = (low.Contains("tctl") || low.Contains("tdie")) ? 3 : (low.Contains("package") ? 2 : (low.Contains("ccd") ? 0 : 1));
                         if (sc > bestTempScore) { bestTempScore = sc; bestTemp = v; }
                         break;
                     case SensorType.Load:
                         if (low == "cpu total") { r.HasCpuLoad = true; r.CpuLoad = v; }
-                        else { int idx = CoreIndex(s.Name); if (idx > 0) cores.Add(new KeyValuePair<int, double>(idx, v)); }
+                        else
+                        {
+                            int idx = CoreIndex(s.Name);
+                            if (idx > 0)
+                            {
+                                double prev;
+                                coreSum[idx] = coreSum.TryGetValue(idx, out prev) ? prev + v : v;
+                                int cnt;
+                                coreCnt[idx] = coreCnt.TryGetValue(idx, out cnt) ? cnt + 1 : 1;
+                            }
+                        }
                         break;
                     case SensorType.Clock:
-                        if (low.StartsWith("core") && !double.IsNaN(v))
+                        if ((low.Contains("core") || low.Contains("ccd") || low.Contains("effective")) && !low.Contains("bus") && v > 0)
                             if (double.IsNaN(maxClock) || v > maxClock) maxClock = v;
                         break;
                     case SensorType.Power:
-                        if (low == "package") { r.HasCpuPower = true; r.CpuPowerW = v; }
+                        int psc = (low == "package" || low == "cpu package") ? 3 : (low.Contains("package") ? 2 : (low.Contains("ppt") ? 1 : -1));
+                        if (psc > bestPowerScore) { bestPowerScore = psc; bestPower = v; }
                         break;
                 }
             }
             if (!double.IsNaN(bestTemp)) { r.HasCpuTemp = true; r.CpuTempC = bestTemp; }
             if (!double.IsNaN(maxClock)) { r.HasCpuClock = true; r.CpuClockMhz = maxClock; }
-            if (cores.Count > 0)
+            if (!double.IsNaN(bestPower)) { r.HasCpuPower = true; r.CpuPowerW = bestPower; }
+            if (coreSum.Count > 0)
             {
-                cores.Sort(delegate (KeyValuePair<int, double> a, KeyValuePair<int, double> b) { return a.Key.CompareTo(b.Key); });
-                double[] arr = new double[cores.Count];
-                for (int i = 0; i < cores.Count; i++) arr[i] = cores[i].Value;
+                List<int> keys = new List<int>(coreSum.Keys);
+                keys.Sort();
+                double[] arr = new double[keys.Count];
+                for (int i = 0; i < keys.Count; i++)
+                {
+                    int k = keys[i];
+                    arr[i] = coreSum[k] / coreCnt[k];
+                }
                 r.CpuCoreLoads = arr;
             }
         }
@@ -187,20 +213,26 @@ namespace LcdFusion
                 switch (s.SensorType)
                 {
                     case SensorType.Temperature:
-                        if (low == "gpu core") tempCore = v; else if (double.IsNaN(tempAny)) tempAny = v;
+                        if (low == "gpu core") tempCore = v;
+                        else if (low.Contains("hot spot") || low.Contains("hotspot")) { r.HasGpuHotSpot = true; r.GpuHotSpotC = v; }
+                        else if (double.IsNaN(tempAny)) tempAny = v;
                         break;
                     case SensorType.Load:
                         if (low == "gpu core") { r.HasGpuLoad = true; r.GpuLoad = v; }
                         break;
                     case SensorType.Clock:
                         if (low == "gpu core") { r.HasGpuClock = true; r.GpuClockMhz = v; }
+                        else if (low.Contains("memory")) { r.HasGpuMemClock = true; r.GpuMemClockMhz = v; }
                         break;
                     case SensorType.Power:
                         if (low.Contains("package") || low.Contains("ppt") || low == "gpu power") { if (double.IsNaN(power) || v > power) power = v; }
                         else if (double.IsNaN(power) && low.Contains("gpu")) power = v;
                         break;
                     case SensorType.Fan:
-                        if (low.Contains("fan")) { r.HasGpuFan = true; r.GpuFanRpm = v; }
+                        if (low.Contains("fan") && (!r.HasGpuFan || v > r.GpuFanRpm)) { r.HasGpuFan = true; r.GpuFanRpm = v; }
+                        break;
+                    case SensorType.Control:
+                        if (low.Contains("fan") && (!r.HasGpuFanPct || v > r.GpuFanPct)) { r.HasGpuFanPct = true; r.GpuFanPct = v; }
                         break;
                     case SensorType.SmallData:
                         if (low == "gpu memory used") vramUsed = v;
@@ -233,10 +265,18 @@ namespace LcdFusion
         private static int CoreIndex(string name)
         {
             if (string.IsNullOrEmpty(name)) return -1;
+            string low = name.ToLowerInvariant();
+            if (!low.Contains("core") || low.Contains("max") || low.Contains("average") || low.Contains("total"))
+                return -1;
             int hash = name.IndexOf('#');
             if (hash < 0) return -1;
+            int i = hash + 1;
+            while (i < name.Length && char.IsWhiteSpace(name[i])) i++;
+            int start = i;
+            while (i < name.Length && name[i] >= '0' && name[i] <= '9') i++;
+            if (i == start) return -1;
             int n;
-            return int.TryParse(name.Substring(hash + 1).Trim(), out n) ? n : -1;
+            return int.TryParse(name.Substring(start, i - start), out n) ? n : -1;
         }
 
         // ---- HWiNFO shared memory (HWiNFO_SENS_SM2) — temp/load fallback ------------
