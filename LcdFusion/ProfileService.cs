@@ -65,6 +65,10 @@ namespace LcdFusion
         public int BoWeiBrightness = 80;
         public string WallpaperAssetsDir = "";
         public string WallpaperRendererPath = "";
+        public string WallpaperGpu = "auto";      // "auto" or "pci:VVVV:DDDD:ORDINAL"
+        public string ScreenOffBehavior = "run";  // "run" | "pause" | "stop"
+        public int WallpaperMaxFps = 0;           // 0 = per-screen default; otherwise 10/15/20/24/30
+        public int WallpaperRenderScale = 100;    // 100 / 75 / 60 / 50 (%)
         public List<int> RecentColors = new List<int>();
     }
 

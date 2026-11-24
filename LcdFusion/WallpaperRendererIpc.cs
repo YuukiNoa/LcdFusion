@@ -874,6 +874,7 @@ namespace LcdFusion
         private readonly Stopwatch _clock = Stopwatch.StartNew();
         private readonly Stopwatch _healthyWatch = new Stopwatch();
         private readonly Dictionary<string, object> _properties = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, object> _gpuSelection;
         private Dictionary<string, object> _lastSensors;
 
         private RendererChildProcess _child;
@@ -897,6 +898,7 @@ namespace LcdFusion
         private volatile string _lastError;
         private volatile string _lastErrorCode;
         private volatile string _backendName = "";
+        private volatile string _activeGpuName = "";
         private volatile bool _isDeElevated;
         private volatile string _launchMode = "";
 
@@ -908,7 +910,7 @@ namespace LcdFusion
         private int _consecutiveCrashes;
         private int _totalRestarts;
 
-        public WallpaperFrameSource(ScreenId screen, string rendererExe, string wallpaperDir, string assetsDir, int width, int height, int fps, Dictionary<string, object> initialProps = null)
+        public WallpaperFrameSource(ScreenId screen, string rendererExe, string wallpaperDir, string assetsDir, int width, int height, int fps, Dictionary<string, object> initialProps = null, Dictionary<string, object> gpuSelection = null)
         {
             _screen = screen;
             _rendererExe = rendererExe ?? "";
@@ -917,6 +919,8 @@ namespace LcdFusion
             _width = ClampDim(width);
             _height = ClampDim(height);
             _fps = ClampFps(fps);
+            if (gpuSelection != null && gpuSelection.Count > 0)
+                _gpuSelection = new Dictionary<string, object>(gpuSelection);
 
             if (initialProps != null)
             {
@@ -940,6 +944,7 @@ namespace LcdFusion
         public string StatusError { get { return _lastError; } }
         public string StatusErrorCode { get { return _lastErrorCode; } }
         public string BackendName { get { return _backendName; } }
+        public string ActiveGpuName { get { return _activeGpuName; } }
         public ulong LastFrameSequence { get { return _lastSeq; } }
         public int RenderWidth { get { return _width; } }
         public int RenderHeight { get { return _height; } }
@@ -1239,6 +1244,10 @@ namespace LcdFusion
             {
                 loadCmd["props"] = new Dictionary<string, object>(_properties, StringComparer.OrdinalIgnoreCase);
             }
+            if (_gpuSelection != null && _gpuSelection.Count > 0)
+            {
+                loadCmd["gpu"] = new Dictionary<string, object>(_gpuSelection);
+            }
             SendCommandLocked(loadCmd);
 
             if (_paused)
@@ -1404,6 +1413,9 @@ namespace LcdFusion
                         object backendObj;
                         if (obj.TryGetValue("backend", out backendObj) && backendObj != null)
                             _backendName = Convert.ToString(backendObj);
+                        object gpuObj;
+                        if (obj.TryGetValue("gpu", out gpuObj) && gpuObj != null)
+                            _activeGpuName = Convert.ToString(gpuObj);
                         if (_lastSensors != null && _lastSensors.Count > 0 && _child != null && !_child.HasExited)
                         {
                             SendCommandLocked(new Dictionary<string, object>

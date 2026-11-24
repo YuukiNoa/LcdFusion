@@ -10,3 +10,7 @@ desktop.ini
 *.user
 *.suo
 .vs/
+
+# Local publish profile & internal architecture notes
+LcdFusion/Properties/PublishProfiles/FolderProfile.pubxml
+docs/project-structure.md

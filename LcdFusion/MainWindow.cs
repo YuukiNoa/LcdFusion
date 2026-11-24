@@ -4,10 +4,12 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
@@ -105,6 +107,13 @@ namespace LcdFusion
         private int _boweiBrightness = BoWeiDirectService.DefaultBrightness;
         private string _wallpaperAssetsDir = "";
         private string _wallpaperRendererPath = "";
+        private string _wallpaperGpuKey = GpuCatalog.AutoKey;
+        private List<GpuAdapterInfo> _availableGpus = new List<GpuAdapterInfo>();
+        private ScreenOffBehavior _screenOffBehavior = ScreenOffBehavior.RunNormally;
+        private int _wallpaperMaxFps = 0;
+        private int _wallpaperRenderScale = 100;
+        private HwndSource _hwndSource;
+        private IntPtr _displayPowerNotifyHandle;
         private volatile bool _valkProbedThisSession;
         private bool _startupChangelogChecked;
         private readonly List<System.Drawing.Color> _recentColors = new List<System.Drawing.Color>();
@@ -130,6 +139,11 @@ namespace LcdFusion
                 : BoWeiDirectService.DefaultBrightness;
             _wallpaperAssetsDir = settings.WallpaperAssetsDir ?? "";
             _wallpaperRendererPath = settings.WallpaperRendererPath ?? "";
+            _wallpaperGpuKey = GpuCatalog.NormalizeKey(settings.WallpaperGpu);
+            _screenOffBehavior = ContentEngine.ParseScreenOffBehavior(settings.ScreenOffBehavior);
+            _wallpaperMaxFps = ContentEngine.NormalizeWallpaperMaxFps(settings.WallpaperMaxFps);
+            _wallpaperRenderScale = ContentEngine.NormalizeWallpaperRenderScale(settings.WallpaperRenderScale);
+            _availableGpus = GpuCatalog.EnumerateGpus();
             _autoStart = AutoStartService.IsEnabled();
 
             ValkyrieDirectService.ConfigurePanel(_valkPanelMode, _lastDetectedValkPanel);
@@ -153,6 +167,9 @@ namespace LcdFusion
 
             _engine = new ContentEngine(_valkRotation, _boweiRotation, _thermalRotation);
             _engine.ConfigureWallpaper(_wallpaperRendererPath, _wallpaperAssetsDir);
+            _engine.SetWallpaperGpu(_wallpaperGpuKey, _availableGpus);
+            _engine.SetScreenOffBehavior(_screenOffBehavior);
+            _engine.SetWallpaperPerformance(_wallpaperMaxFps, _wallpaperRenderScale);
 
             Title = "LCD Fusion";
             Width = 1240; Height = 860; MinWidth = 1040; MinHeight = 740;
@@ -432,6 +449,9 @@ namespace LcdFusion
             headerRight.Children.Add(DevicePill(ScreenId.BoWei));
             headerRight.Children.Add(DevicePill(ScreenId.Thermalright));
             headerRight.Children.Add(LangSelector());
+            var settingsBtn = Btn(Loc.T("btn.settings"), delegate { ShowSettingsDialog(); }, "BtnGhost");
+            settingsBtn.Margin = new Thickness(8, 0, 0, 0);
+            headerRight.Children.Add(settingsBtn);
             var about = Btn(Loc.T("btn.about"), delegate { ShowAboutDialog(); }, "BtnGhost");
             about.Margin = new Thickness(8, 0, 0, 0);
             headerRight.Children.Add(about);
@@ -818,6 +838,396 @@ namespace LcdFusion
             sv.Content = stack;
             card.Child = sv;
             return card;
+        }
+
+        private void ShowSettingsDialog()
+        {
+            var dlg = new Window
+            {
+                Title = Loc.T("settings.title"),
+                Owner = this,
+                Width = 540,
+                SizeToContent = SizeToContent.Height,
+                ResizeMode = ResizeMode.NoResize,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                Background = Bg,
+                Foreground = TextBr,
+                FontFamily = new FontFamily("Segoe UI"),
+                Icon = BuildWindowIcon()
+            };
+            dlg.Resources.MergedDictionaries.Add(Theme.Build());
+            Theme.ApplyDarkTitleBar(dlg);
+
+            var root = new StackPanel { Margin = new Thickness(22, 18, 22, 20) };
+
+            root.Children.Add(new TextBlock
+            {
+                Text = Loc.T("settings.title"),
+                FontSize = 20,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = TextBr,
+                Margin = new Thickness(0, 0, 0, 14)
+            });
+
+            // Card 1: Render GPU
+            var gpuCard = new Border
+            {
+                Background = Surface,
+                CornerRadius = new CornerRadius(10),
+                Padding = new Thickness(16, 13, 16, 13),
+                BorderBrush = SoftBr,
+                BorderThickness = new Thickness(1)
+            };
+            var gpuStack = new StackPanel();
+            gpuStack.Children.Add(new TextBlock
+            {
+                Text = Loc.T("rt.gpu"),
+                Foreground = TextBr,
+                FontSize = 13,
+                FontWeight = FontWeights.SemiBold,
+                Margin = new Thickness(0, 0, 0, 8)
+            });
+
+            _availableGpus = GpuCatalog.EnumerateGpus();
+            var gpuCombo = new ComboBox { VerticalAlignment = VerticalAlignment.Center };
+            gpuCombo.Items.Add(new ComboBoxItem { Content = Loc.T("rt.gpuAuto"), Tag = GpuCatalog.AutoKey });
+
+            int selectedGpuIdx = 0;
+            for (int i = 0; i < _availableGpus.Count; i++)
+            {
+                GpuAdapterInfo gpu = _availableGpus[i];
+                gpuCombo.Items.Add(new ComboBoxItem { Content = gpu.DisplayName, Tag = gpu.Key });
+                if (string.Equals(gpu.Key, _wallpaperGpuKey, StringComparison.OrdinalIgnoreCase))
+                    selectedGpuIdx = i + 1;
+            }
+            if (selectedGpuIdx == 0 && !string.Equals(_wallpaperGpuKey, GpuCatalog.AutoKey, StringComparison.OrdinalIgnoreCase))
+            {
+                GpuAdapterInfo resolved = GpuCatalog.Resolve(_wallpaperGpuKey, _availableGpus);
+                if (resolved != null)
+                {
+                    for (int i = 0; i < _availableGpus.Count; i++)
+                    {
+                        if (string.Equals(_availableGpus[i].Key, resolved.Key, StringComparison.OrdinalIgnoreCase))
+                        {
+                            selectedGpuIdx = i + 1;
+                            _wallpaperGpuKey = resolved.Key;
+                            break;
+                        }
+                    }
+                }
+            }
+            gpuCombo.SelectedIndex = selectedGpuIdx;
+            gpuCombo.SelectionChanged += delegate
+            {
+                var item = gpuCombo.SelectedItem as ComboBoxItem;
+                if (item == null) return;
+                string nextKey = GpuCatalog.NormalizeKey(item.Tag as string);
+                if (string.Equals(nextKey, _wallpaperGpuKey, StringComparison.OrdinalIgnoreCase)) return;
+                _wallpaperGpuKey = nextKey;
+                _engine.SetWallpaperGpu(_wallpaperGpuKey, _availableGpus);
+                SaveCurrentSettings();
+            };
+            gpuStack.Children.Add(gpuCombo);
+
+            gpuStack.Children.Add(new TextBlock
+            {
+                Text = Loc.T("rt.gpuHint"),
+                Foreground = MutedBr,
+                FontSize = 11.5,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(1, 7, 0, 0)
+            });
+            gpuCard.Child = gpuStack;
+            root.Children.Add(gpuCard);
+
+            // Card 2: Screen-off behavior
+            var offCard = new Border
+            {
+                Background = Surface,
+                CornerRadius = new CornerRadius(10),
+                Padding = new Thickness(16, 13, 16, 13),
+                Margin = new Thickness(0, 12, 0, 0),
+                BorderBrush = SoftBr,
+                BorderThickness = new Thickness(1)
+            };
+            var offStack = new StackPanel();
+            offStack.Children.Add(new TextBlock
+            {
+                Text = Loc.T("rt.screenOff"),
+                Foreground = TextBr,
+                FontSize = 13,
+                FontWeight = FontWeights.SemiBold,
+                Margin = new Thickness(0, 0, 0, 9)
+            });
+
+            Button runBtn = null, pauseBtn = null, stopBtn = null;
+            var hintText = new TextBlock
+            {
+                Foreground = MutedBr,
+                FontSize = 11.5,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(1, 2, 0, 0)
+            };
+
+            Action syncOffUi = delegate
+            {
+                StyleChip(runBtn, _screenOffBehavior == ScreenOffBehavior.RunNormally);
+                StyleChip(pauseBtn, _screenOffBehavior == ScreenOffBehavior.Pause);
+                StyleChip(stopBtn, _screenOffBehavior == ScreenOffBehavior.Stop);
+                switch (_screenOffBehavior)
+                {
+                    case ScreenOffBehavior.Pause:
+                        hintText.Text = Loc.T("rt.screenOff.hintPause");
+                        break;
+                    case ScreenOffBehavior.Stop:
+                        hintText.Text = Loc.T("rt.screenOff.hintStop");
+                        break;
+                    default:
+                        hintText.Text = Loc.T("rt.screenOff.hintRun");
+                        break;
+                }
+            };
+
+            Action<ScreenOffBehavior> selectBehavior = b =>
+            {
+                if (_screenOffBehavior == b) return;
+                _screenOffBehavior = b;
+                _engine.SetScreenOffBehavior(b);
+                syncOffUi();
+                SaveCurrentSettings();
+            };
+
+            Func<string, ScreenOffBehavior, Button> makeDlgChip = (text, behavior) =>
+            {
+                var btn = new Button { Content = text, Margin = new Thickness(0, 0, 8, 8) };
+                btn.Style = (Style)dlg.FindResource("BtnChip");
+                btn.Click += delegate { selectBehavior(behavior); };
+                return btn;
+            };
+
+            var offRow = new WrapPanel();
+            runBtn = makeDlgChip(Loc.T("rt.screenOff.run"), ScreenOffBehavior.RunNormally);
+            pauseBtn = makeDlgChip(Loc.T("rt.screenOff.pause"), ScreenOffBehavior.Pause);
+            stopBtn = makeDlgChip(Loc.T("rt.screenOff.stop"), ScreenOffBehavior.Stop);
+            offRow.Children.Add(runBtn);
+            offRow.Children.Add(pauseBtn);
+            offRow.Children.Add(stopBtn);
+            offStack.Children.Add(offRow);
+
+            syncOffUi();
+            offStack.Children.Add(hintText);
+            offCard.Child = offStack;
+            root.Children.Add(offCard);
+
+            // Card 3: Rendering performance (FPS cap + Render resolution scale)
+            var perfCard = new Border
+            {
+                Background = Surface,
+                CornerRadius = new CornerRadius(10),
+                Padding = new Thickness(16, 13, 16, 13),
+                Margin = new Thickness(0, 12, 0, 0),
+                BorderBrush = SoftBr,
+                BorderThickness = new Thickness(1)
+            };
+            var perfStack = new StackPanel();
+            perfStack.Children.Add(new TextBlock
+            {
+                Text = Loc.T("rt.perf"),
+                Foreground = TextBr,
+                FontSize = 13,
+                FontWeight = FontWeights.SemiBold,
+                Margin = new Thickness(0, 0, 0, 9)
+            });
+
+            perfStack.Children.Add(new TextBlock
+            {
+                Text = Loc.T("rt.fpsCap"),
+                Foreground = MutedBr,
+                FontSize = 11.5,
+                Margin = new Thickness(1, 0, 0, 6)
+            });
+
+            int[] fpsOptions = { 0, 24, 20, 15, 10 };
+            var fpsButtons = new List<Button>();
+            var fpsRow = new WrapPanel();
+
+            int[] scaleOptions = { 100, 75, 60, 50 };
+            var scaleButtons = new List<Button>();
+            var scaleRow = new WrapPanel();
+
+            var perfHintText = new TextBlock
+            {
+                Foreground = MutedBr,
+                FontSize = 11.5,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(1, 2, 0, 0)
+            };
+
+            Action syncPerfUi = delegate
+            {
+                for (int i = 0; i < fpsOptions.Length; i++)
+                    StyleChip(fpsButtons[i], _wallpaperMaxFps == fpsOptions[i]);
+                for (int i = 0; i < scaleOptions.Length; i++)
+                    StyleChip(scaleButtons[i], _wallpaperRenderScale == scaleOptions[i]);
+
+                int vw, vh, bw, bh;
+                _engine.EffectiveWallpaperRenderSize(ScreenId.Valkyrie, out vw, out vh);
+                _engine.EffectiveWallpaperRenderSize(ScreenId.BoWei, out bw, out bh);
+                int vfps = _engine.EffectiveWallpaperFps(ScreenId.Valkyrie);
+                int bfps = _engine.EffectiveWallpaperFps(ScreenId.BoWei);
+                string summary = string.Format("Valkyrie {0}×{1}@{2}fps · BoWei {3}×{4}@{5}fps", vw, vh, vfps, bw, bh, bfps);
+                perfHintText.Text = Loc.T("rt.perfHint", summary);
+            };
+
+            for (int i = 0; i < fpsOptions.Length; i++)
+            {
+                int val = fpsOptions[i];
+                string label = val == 0 ? Loc.T("rt.fpsAuto") : (val + " FPS");
+                var btn = new Button { Content = label, Margin = new Thickness(0, 0, 8, 8) };
+                btn.Style = (Style)dlg.FindResource("BtnChip");
+                btn.Click += delegate
+                {
+                    if (_wallpaperMaxFps == val) return;
+                    _wallpaperMaxFps = val;
+                    _engine.SetWallpaperPerformance(_wallpaperMaxFps, _wallpaperRenderScale);
+                    syncPerfUi();
+                    SaveCurrentSettings();
+                };
+                fpsButtons.Add(btn);
+                fpsRow.Children.Add(btn);
+            }
+            perfStack.Children.Add(fpsRow);
+
+            perfStack.Children.Add(new TextBlock
+            {
+                Text = Loc.T("rt.renderScale"),
+                Foreground = MutedBr,
+                FontSize = 11.5,
+                Margin = new Thickness(1, 4, 0, 6)
+            });
+
+            string[] scaleLabels = { Loc.T("rt.scaleNative"), Loc.T("rt.scale75"), Loc.T("rt.scale60"), Loc.T("rt.scale50") };
+            for (int i = 0; i < scaleOptions.Length; i++)
+            {
+                int val = scaleOptions[i];
+                var btn = new Button { Content = scaleLabels[i], Margin = new Thickness(0, 0, 8, 8) };
+                btn.Style = (Style)dlg.FindResource("BtnChip");
+                btn.Click += delegate
+                {
+                    if (_wallpaperRenderScale == val) return;
+                    _wallpaperRenderScale = val;
+                    _engine.SetWallpaperPerformance(_wallpaperMaxFps, _wallpaperRenderScale);
+                    syncPerfUi();
+                    SaveCurrentSettings();
+                };
+                scaleButtons.Add(btn);
+                scaleRow.Children.Add(btn);
+            }
+            perfStack.Children.Add(scaleRow);
+
+            syncPerfUi();
+            perfStack.Children.Add(perfHintText);
+            perfCard.Child = perfStack;
+            root.Children.Add(perfCard);
+
+            // Footer
+            var close = new Button
+            {
+                Content = Loc.T("dlg.close"),
+                Style = (Style)dlg.FindResource("BtnPrimary"),
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 16, 0, 0),
+                IsCancel = true
+            };
+            close.Click += delegate { dlg.Close(); };
+            root.Children.Add(close);
+
+            dlg.Content = root;
+            dlg.ShowDialog();
+        }
+
+        private void StyleChip(Button b, bool active)
+        {
+            if (b == null) return;
+            if (active)
+            {
+                b.Background = AccentBr;
+                b.Foreground = AccentTextBr;
+                b.BorderBrush = AccentBr;
+                b.FontWeight = FontWeights.SemiBold;
+            }
+            else
+            {
+                b.ClearValue(Button.BackgroundProperty);
+                b.ClearValue(Button.ForegroundProperty);
+                b.ClearValue(Button.BorderBrushProperty);
+                b.ClearValue(Button.FontWeightProperty);
+            }
+        }
+
+        // ---- Windows display power notifications ------------------------------------
+
+        private static readonly Guid GuidConsoleDisplayState = new Guid("6FE69556-704A-47A0-8F24-C28D936FDA47");
+        private const int WM_POWERBROADCAST = 0x0218;
+        private const int PBT_APMSUSPEND = 0x0004;
+        private const int PBT_APMRESUMESUSPEND = 0x0007;
+        private const int PBT_POWERSETTINGCHANGE = 0x8013;
+        private const uint DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr RegisterPowerSettingNotification(IntPtr hRecipient, ref Guid powerSettingGuid, uint flags);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool UnregisterPowerSettingNotification(IntPtr handle);
+
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+            try
+            {
+                IntPtr hwnd = new WindowInteropHelper(this).Handle;
+                if (hwnd == IntPtr.Zero) return;
+                _hwndSource = HwndSource.FromHwnd(hwnd);
+                if (_hwndSource != null)
+                    _hwndSource.AddHook(WndProcHook);
+                Guid guid = GuidConsoleDisplayState;
+                _displayPowerNotifyHandle = RegisterPowerSettingNotification(hwnd, ref guid, DEVICE_NOTIFY_WINDOW_HANDLE);
+            }
+            catch { }
+        }
+
+        private IntPtr WndProcHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (msg == WM_POWERBROADCAST)
+            {
+                int wp = wParam.ToInt32();
+                if (wp == PBT_POWERSETTINGCHANGE && lParam != IntPtr.Zero)
+                {
+                    try
+                    {
+                        byte[] guidBytes = new byte[16];
+                        Marshal.Copy(lParam, guidBytes, 0, 16);
+                        var settingGuid = new Guid(guidBytes);
+                        if (settingGuid == GuidConsoleDisplayState)
+                        {
+                            int dataLen = Marshal.ReadInt32(lParam, 16);
+                            int displayState = dataLen >= 4 ? Marshal.ReadInt32(lParam, 20) : Marshal.ReadByte(lParam, 20);
+                            // 0 = Display Off, 1 = Display On, 2 = Display Dimmed
+                            _engine.SetDisplayOff(displayState == 0);
+                        }
+                    }
+                    catch { }
+                }
+                else if (wp == PBT_APMSUSPEND)
+                {
+                    _engine.SetDisplayOff(true);
+                }
+                else if (wp == PBT_APMRESUMESUSPEND)
+                {
+                    _engine.SetDisplayOff(false);
+                }
+            }
+            return IntPtr.Zero;
         }
 
         private void ShowAboutDialog()
@@ -2903,6 +3313,16 @@ namespace LcdFusion
 
         protected override void OnClosed(EventArgs e)
         {
+            if (_displayPowerNotifyHandle != IntPtr.Zero)
+            {
+                try { UnregisterPowerSettingNotification(_displayPowerNotifyHandle); } catch { }
+                _displayPowerNotifyHandle = IntPtr.Zero;
+            }
+            if (_hwndSource != null)
+            {
+                try { _hwndSource.RemoveHook(WndProcHook); } catch { }
+                _hwndSource = null;
+            }
             if (_tray != null) { _tray.Visible = false; _tray.Dispose(); _tray = null; }
             if (_trayIcon != null) { _trayIcon.Dispose(); _trayIcon = null; }
             try { ProfileService.SaveLast(_engine.Capture(_tgtValk, _tgtBoWei, _tgtThermal, _activeScreen)); } catch { }
@@ -2934,6 +3354,10 @@ namespace LcdFusion
                     BoWeiBrightness = _boweiBrightness,
                     WallpaperAssetsDir = _wallpaperAssetsDir,
                     WallpaperRendererPath = _wallpaperRendererPath,
+                    WallpaperGpu = _wallpaperGpuKey,
+                    ScreenOffBehavior = ContentEngine.ScreenOffBehaviorToSetting(_screenOffBehavior),
+                    WallpaperMaxFps = _wallpaperMaxFps,
+                    WallpaperRenderScale = _wallpaperRenderScale,
                     RecentColors = RecentColorArgb()
                 });
             }

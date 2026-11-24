@@ -13,6 +13,7 @@ namespace LcdFusion
     internal enum BackgroundKind { None, Color, Image, Gif, Wallpaper }
     internal enum OverlayKind { Text, CpuTemp, GpuTemp, CpuLoad, GpuLoad, Clock, Date, CpuClock, GpuClock, CpuPower, GpuPower, GpuVram, RamLoad, GpuFan, CpuCores }
     internal enum FitMode { Fit, Fill, Stretch }
+    internal enum ScreenOffBehavior { RunNormally, Pause, Stop }
 
     // A movable text/sensor layer drawn on top of the background.
     internal sealed class Overlay
@@ -157,6 +158,18 @@ namespace LcdFusion
         private readonly List<IBackgroundSource> _pendingDispose = new List<IBackgroundSource>();
         private string _wallpaperRendererPath = "";
         private string _wallpaperAssetsDir = "";
+        private string _wallpaperGpuKey = GpuCatalog.AutoKey;
+        private GpuAdapterInfo _wallpaperGpu;
+        private bool _reloadWallpapersRequested;
+        private int _wallpaperMaxFps = 0;         // 0 = per-screen default
+        private int _wallpaperRenderScale = 100;  // 50..100 (%)
+        private readonly ulong[] _lastStreamedSeq = new ulong[3];
+        private ulong _lastPreviewSeq;
+        private ScreenId _lastPreviewSeqScreen = ScreenId.Valkyrie;
+        private ScreenOffBehavior _screenOffBehavior = ScreenOffBehavior.RunNormally;
+        private bool _displayOff;
+        private ScreenOffBehavior _appliedDisplayOffMode = ScreenOffBehavior.RunNormally;
+        private readonly long[] _wakeHoldUntilMs = new long[3];
         private bool _targetValk = true;
         private bool _targetBoWei;
         private bool _targetThermal;
@@ -309,6 +322,23 @@ namespace LcdFusion
             }
         }
 
+        public static ScreenOffBehavior ParseScreenOffBehavior(string value)
+        {
+            if (string.Equals(value, "pause", StringComparison.OrdinalIgnoreCase)) return ScreenOffBehavior.Pause;
+            if (string.Equals(value, "stop", StringComparison.OrdinalIgnoreCase)) return ScreenOffBehavior.Stop;
+            return ScreenOffBehavior.RunNormally;
+        }
+
+        public static string ScreenOffBehaviorToSetting(ScreenOffBehavior behavior)
+        {
+            switch (behavior)
+            {
+                case ScreenOffBehavior.Pause: return "pause";
+                case ScreenOffBehavior.Stop: return "stop";
+                default: return "run";
+            }
+        }
+
         public void ConfigureWallpaper(string rendererPath, string assetsDir)
         {
             lock (_lock)
@@ -316,6 +346,121 @@ namespace LcdFusion
                 _wallpaperRendererPath = rendererPath ?? "";
                 _wallpaperAssetsDir = assetsDir ?? "";
             }
+        }
+
+        public void SetWallpaperGpu(string gpuKey, List<GpuAdapterInfo> knownGpus = null)
+        {
+            string norm = GpuCatalog.NormalizeKey(gpuKey);
+            GpuAdapterInfo resolved = GpuCatalog.Resolve(norm, knownGpus);
+            lock (_lock)
+            {
+                bool changed = !string.Equals(_wallpaperGpuKey, norm, StringComparison.OrdinalIgnoreCase);
+                _wallpaperGpuKey = norm;
+                _wallpaperGpu = resolved;
+                if (changed) _reloadWallpapersRequested = true;
+            }
+        }
+
+        public void SetScreenOffBehavior(ScreenOffBehavior behavior)
+        {
+            lock (_lock)
+            {
+                _screenOffBehavior = behavior;
+            }
+        }
+
+        public static int NormalizeWallpaperMaxFps(int fps)
+        {
+            if (fps <= 0) return 0;
+            if (fps < 5) return 5;
+            if (fps > 60) return 60;
+            return fps;
+        }
+
+        public static int NormalizeWallpaperRenderScale(int pct)
+        {
+            if (pct <= 0) return 100;
+            if (pct < 25) return 25;
+            if (pct > 100) return 100;
+            return pct;
+        }
+
+        public void SetWallpaperPerformance(int maxFps, int renderScalePct)
+        {
+            int normFps = NormalizeWallpaperMaxFps(maxFps);
+            int normScale = NormalizeWallpaperRenderScale(renderScalePct);
+            lock (_lock)
+            {
+                _wallpaperMaxFps = normFps;
+                _wallpaperRenderScale = normScale;
+                _dirtyValk = true;
+                _dirtyBoWei = true;
+                _dirtyThermal = true;
+                _dirtyPreview = true;
+            }
+        }
+
+        public int EffectiveWallpaperFps(ScreenId screen)
+        {
+            int baseFps;
+            int cap;
+            lock (_lock)
+            {
+                baseFps = Scene(screen).TargetRendererFps(screen);
+                cap = _wallpaperMaxFps;
+            }
+            return (cap > 0 && cap < baseFps) ? cap : baseFps;
+        }
+
+        public void EffectiveWallpaperRenderSize(ScreenId screen, out int width, out int height)
+        {
+            int cw, ch;
+            CanvasSize(screen, out cw, out ch);
+            int scalePct;
+            lock (_lock) { scalePct = _wallpaperRenderScale; }
+            if (scalePct >= 100)
+            {
+                width = cw;
+                height = ch;
+                return;
+            }
+            double s = scalePct / 100.0;
+            int w = (int)Math.Round(cw * s);
+            int h = (int)Math.Round(ch * s);
+            w = Math.Max(64, (w + 1) & ~1);
+            h = Math.Max(64, (h + 1) & ~1);
+            if (w > cw) w = cw;
+            if (h > ch) h = ch;
+            width = w;
+            height = h;
+        }
+
+        public void SetDisplayOff(bool off)
+        {
+            lock (_lock)
+            {
+                _displayOff = off;
+            }
+        }
+
+        private Dictionary<string, object> SnapshotWallpaperGpuPayload()
+        {
+            GpuAdapterInfo gpu;
+            string key;
+            lock (_lock)
+            {
+                gpu = _wallpaperGpu;
+                key = _wallpaperGpuKey;
+            }
+            if (gpu == null && !string.Equals(key, GpuCatalog.AutoKey, StringComparison.OrdinalIgnoreCase))
+            {
+                gpu = GpuCatalog.Resolve(key);
+                if (gpu != null)
+                {
+                    lock (_lock) { _wallpaperGpu = gpu; }
+                }
+            }
+            return GpuCatalog.ToIpcPayload(gpu);
         }
 
         public string ResolvedWallpaperRendererPath()
@@ -455,13 +600,13 @@ namespace LcdFusion
                     throw new FileNotFoundException(Loc.T("err.wpeNoRenderer"));
 
                 string assetsDir = ResolvedWallpaperAssetsDir();
-                int cw, ch;
-                CanvasSize(screen, out cw, out ch);
-                int fps;
-                lock (_lock) { fps = Scene(screen).TargetRendererFps(screen); }
+                int rw, rh;
+                EffectiveWallpaperRenderSize(screen, out rw, out rh);
+                int fps = EffectiveWallpaperFps(screen);
 
                 Dictionary<string, object> typedProps = WallpaperCatalog.ConvertPropsToTypedMap(initialProps, entry.Properties);
-                WallpaperFrameSource source = new WallpaperFrameSource(screen, rendererExe, entry.Directory, assetsDir, cw, ch, fps, typedProps);
+                Dictionary<string, object> gpuPayload = SnapshotWallpaperGpuPayload();
+                WallpaperFrameSource source = new WallpaperFrameSource(screen, rendererExe, entry.Directory, assetsDir, rw, rh, fps, typedProps, gpuPayload);
                 SensorReading snapSensors = null;
                 lock (_lock)
                 {
@@ -723,10 +868,9 @@ namespace LcdFusion
                     string rendererExe = ResolvedWallpaperRendererPath();
                     if (entry != null && !string.IsNullOrEmpty(rendererExe))
                     {
-                        int cw, ch;
-                        CanvasSize(screen, out cw, out ch);
-                        int fps;
-                        lock (_lock) { fps = Scene(screen).TargetRendererFps(screen); }
+                        int rw, rh;
+                        EffectiveWallpaperRenderSize(screen, out rw, out rh);
+                        int fps = EffectiveWallpaperFps(screen);
                         var propStrings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                         if (d.WallpaperProps != null)
                         {
@@ -734,7 +878,8 @@ namespace LcdFusion
                                 if (pe != null && !string.IsNullOrEmpty(pe.Key)) propStrings[pe.Key] = pe.Value ?? "";
                         }
                         Dictionary<string, object> typedProps = WallpaperCatalog.ConvertPropsToTypedMap(propStrings, entry.Properties);
-                        source = new WallpaperFrameSource(screen, rendererExe, entry.Directory, ResolvedWallpaperAssetsDir(), cw, ch, fps, typedProps);
+                        Dictionary<string, object> gpuPayload = SnapshotWallpaperGpuPayload();
+                        source = new WallpaperFrameSource(screen, rendererExe, entry.Directory, ResolvedWallpaperAssetsDir(), rw, rh, fps, typedProps, gpuPayload);
                         mediaName = entry.DisplayTitle;
                         wallpaperType = entry.Type ?? "scene";
                     }
@@ -816,6 +961,39 @@ namespace LcdFusion
                 int delta = (int)(now - lastTick);
                 lastTick = now;
 
+                bool displayOff;
+                ScreenOffBehavior screenOffBehavior;
+                lock (_lock)
+                {
+                    displayOff = _displayOff;
+                    screenOffBehavior = _screenOffBehavior;
+                }
+
+                ScreenOffBehavior targetOffMode = displayOff ? screenOffBehavior : ScreenOffBehavior.RunNormally;
+                if (targetOffMode != _appliedDisplayOffMode)
+                {
+                    ApplyDisplayOffTransition(_appliedDisplayOffMode, targetOffMode);
+                    _appliedDisplayOffMode = targetOffMode;
+                }
+
+                if (_appliedDisplayOffMode != ScreenOffBehavior.RunNormally)
+                {
+                    lock (_lock) { DrainPendingDisposeLocked(); }
+                    Thread.Sleep(100);
+                    continue;
+                }
+
+                bool reloadWallpapers;
+                lock (_lock)
+                {
+                    reloadWallpapers = _reloadWallpapersRequested;
+                    if (reloadWallpapers) _reloadWallpapersRequested = false;
+                }
+                if (reloadWallpapers)
+                {
+                    ReloadActiveWallpapersForGpuChange();
+                }
+
                 bool needSensors;
                 lock (_lock) { needSensors = _valk.NeedsSensorData() || _bowei.NeedsSensorData() || _thermal.NeedsSensorData(); }
                 if (needSensors && (lastSensor == 0 || now - lastSensor >= 1000))
@@ -856,18 +1034,37 @@ namespace LcdFusion
                 FitMode valkFit, boweiFit, thermalFit;
                 lock (_lock)
                 {
-                    valkInterval = _valk.StreamIntervalMs(ScreenId.Valkyrie);
-                    boweiInterval = _bowei.StreamIntervalMs(ScreenId.BoWei);
-                    thermalInterval = _thermal.StreamIntervalMs(ScreenId.Thermalright);
-                    previewScreen = _previewScreen; previewEnabled = _previewEnabled; streaming = _streaming;
-                    tv = _targetValk; tb = _targetBoWei; tt = _targetThermal;
-                    previewInterval = Scene(previewScreen).PreviewIntervalMs();
-                    valkWpe = _valk.Source as WallpaperFrameSource;
-                    boweiWpe = _bowei.Source as WallpaperFrameSource;
-                    thermalWpe = _thermal.Source as WallpaperFrameSource;
+                    int fpsCap = _wallpaperMaxFps;
                     valkFps = _valk.TargetRendererFps(ScreenId.Valkyrie);
                     boweiFps = _bowei.TargetRendererFps(ScreenId.BoWei);
                     thermalFps = _thermal.TargetRendererFps(ScreenId.Thermalright);
+                    if (fpsCap > 0)
+                    {
+                        if (fpsCap < valkFps) valkFps = fpsCap;
+                        if (fpsCap < boweiFps) boweiFps = fpsCap;
+                        if (fpsCap < thermalFps) thermalFps = fpsCap;
+                    }
+                    valkInterval = _valk.StreamIntervalMs(ScreenId.Valkyrie);
+                    boweiInterval = _bowei.StreamIntervalMs(ScreenId.BoWei);
+                    thermalInterval = _thermal.StreamIntervalMs(ScreenId.Thermalright);
+                    if (_valk.Background == BackgroundKind.Wallpaper && valkFps > 0)
+                        valkInterval = Math.Max(valkInterval, 1000 / valkFps);
+                    if (_bowei.Background == BackgroundKind.Wallpaper && boweiFps > 0)
+                        boweiInterval = Math.Max(boweiInterval, 1000 / boweiFps);
+                    if (_thermal.Background == BackgroundKind.Wallpaper && thermalFps > 0)
+                        thermalInterval = Math.Max(thermalInterval, 1000 / thermalFps);
+
+                    previewScreen = _previewScreen; previewEnabled = _previewEnabled; streaming = _streaming;
+                    tv = _targetValk; tb = _targetBoWei; tt = _targetThermal;
+                    previewInterval = Scene(previewScreen).PreviewIntervalMs();
+                    if (Scene(previewScreen).Background == BackgroundKind.Wallpaper)
+                    {
+                        int pf = previewScreen == ScreenId.BoWei ? boweiFps : (previewScreen == ScreenId.Thermalright ? thermalFps : valkFps);
+                        if (pf > 0) previewInterval = Math.Max(previewInterval, 1000 / pf);
+                    }
+                    valkWpe = _valk.Source as WallpaperFrameSource;
+                    boweiWpe = _bowei.Source as WallpaperFrameSource;
+                    thermalWpe = _thermal.Source as WallpaperFrameSource;
                     valkFit = _valk.Fit;
                     boweiFit = _bowei.Fit;
                     thermalFit = _thermal.Fit;
@@ -878,24 +1075,231 @@ namespace LcdFusion
                 SyncWallpaperSource(ScreenId.Thermalright, thermalWpe, (streaming && tt) || (previewEnabled && previewScreen == ScreenId.Thermalright), thermalFps, thermalFit);
                 SyncWallpaperErrors(valkWpe, boweiWpe, thermalWpe, streaming, tv, tb, tt, previewEnabled, previewScreen);
 
-                if (previewEnabled && (_dirtyPreview || ShouldRefresh(now, lastPreview, previewInterval)))
+                WallpaperFrameSource previewWpe = previewScreen == ScreenId.BoWei ? boweiWpe : (previewScreen == ScreenId.Thermalright ? thermalWpe : valkWpe);
+                bool previewHasNewWallpaperFrame = previewWpe == null || previewWpe.HasPendingFrame || previewWpe.LastFrameSequence != _lastPreviewSeq || _lastPreviewSeqScreen != previewScreen;
+                if (previewEnabled && (_dirtyPreview || (ShouldRefresh(now, lastPreview, previewInterval) && previewHasNewWallpaperFrame)))
                 {
                     RenderPreview(previewScreen);
                     lastPreview = now;
                     _dirtyPreview = false;
+                    if (previewWpe != null)
+                    {
+                        _lastPreviewSeq = previewWpe.LastFrameSequence;
+                        _lastPreviewSeqScreen = previewScreen;
+                    }
                 }
 
                 if (streaming)
                 {
-                    if (tv && (_dirtyValk || ShouldRefresh(now, lastValk, valkInterval)))
-                    { PushValkyrie(); lastValk = now; _dirtyValk = false; }
-                    if (tb && (_dirtyBoWei || ShouldRefresh(now, lastBoWei, boweiInterval)))
-                    { PushBoWei(); lastBoWei = now; _dirtyBoWei = false; }
-                    if (tt && (_dirtyThermal || ShouldRefresh(now, lastThermal, thermalInterval)))
-                    { PushThermalright(); lastThermal = now; _dirtyThermal = false; }
+                    bool valkHasNew = valkWpe == null || valkWpe.HasPendingFrame || valkWpe.LastFrameSequence != _lastStreamedSeq[0];
+                    if (tv && !IsWaitingForWallpaperFirstFrame(ScreenId.Valkyrie, valkWpe, now) && (_dirtyValk || (ShouldRefresh(now, lastValk, valkInterval) && valkHasNew)))
+                    {
+                        PushValkyrie();
+                        lastValk = now;
+                        _dirtyValk = false;
+                        if (valkWpe != null) _lastStreamedSeq[0] = valkWpe.LastFrameSequence;
+                    }
+                    bool boweiHasNew = boweiWpe == null || boweiWpe.HasPendingFrame || boweiWpe.LastFrameSequence != _lastStreamedSeq[1];
+                    if (tb && !IsWaitingForWallpaperFirstFrame(ScreenId.BoWei, boweiWpe, now) && (_dirtyBoWei || (ShouldRefresh(now, lastBoWei, boweiInterval) && boweiHasNew)))
+                    {
+                        PushBoWei();
+                        lastBoWei = now;
+                        _dirtyBoWei = false;
+                        if (boweiWpe != null) _lastStreamedSeq[1] = boweiWpe.LastFrameSequence;
+                    }
+                    bool thermalHasNew = thermalWpe == null || thermalWpe.HasPendingFrame || thermalWpe.LastFrameSequence != _lastStreamedSeq[2];
+                    if (tt && !IsWaitingForWallpaperFirstFrame(ScreenId.Thermalright, thermalWpe, now) && (_dirtyThermal || (ShouldRefresh(now, lastThermal, thermalInterval) && thermalHasNew)))
+                    {
+                        PushThermalright();
+                        lastThermal = now;
+                        _dirtyThermal = false;
+                        if (thermalWpe != null) _lastStreamedSeq[2] = thermalWpe.LastFrameSequence;
+                    }
                 }
 
                 Thread.Sleep(15);
+            }
+        }
+
+        private bool IsWaitingForWallpaperFirstFrame(ScreenId screen, WallpaperFrameSource wpe, long now)
+        {
+            int idx = (int)screen;
+            if (idx < 0 || idx >= _wakeHoldUntilMs.Length) return false;
+            long deadline = _wakeHoldUntilMs[idx];
+            if (deadline == 0) return false;
+
+            if (wpe == null || wpe.HasPendingFrame || wpe.LastFrameSequence > 0 ||
+                !string.IsNullOrEmpty(wpe.StatusError) || (now - deadline) >= 0)
+            {
+                _wakeHoldUntilMs[idx] = 0;
+                return false;
+            }
+            return true;
+        }
+
+        private void ApplyDisplayOffTransition(ScreenOffBehavior fromMode, ScreenOffBehavior toMode)
+        {
+            if (toMode == ScreenOffBehavior.Pause)
+            {
+                // Pause: close wallpaper renderer processes (0% GPU/VRAM) while keeping USB hardware
+                // streaming threads alive so every LCD stays frozen on its last rendered frame.
+                lock (_lock)
+                {
+                    UnloadWallpaperSourceLocked(_valk);
+                    UnloadWallpaperSourceLocked(_bowei);
+                    UnloadWallpaperSourceLocked(_thermal);
+                    DrainPendingDisposeLocked();
+                }
+                Report(true, Loc.T("st.displayOffPaused"));
+                return;
+            }
+
+            if (toMode == ScreenOffBehavior.Stop)
+            {
+                // Stop: close wallpaper renderer processes AND stop all USB LCD streaming threads.
+                lock (_lock)
+                {
+                    UnloadWallpaperSourceLocked(_valk);
+                    UnloadWallpaperSourceLocked(_bowei);
+                    UnloadWallpaperSourceLocked(_thermal);
+                    DrainPendingDisposeLocked();
+                }
+                StopAllHardwareServices();
+                Report(true, Loc.T("st.displayOffStopped"));
+                return;
+            }
+
+            // Transitioning back to RunNormally (display woke up or user switched option to RunNormally)
+            if (fromMode == ScreenOffBehavior.Pause || fromMode == ScreenOffBehavior.Stop)
+            {
+                bool holdUntilFirstFrame = (fromMode == ScreenOffBehavior.Pause);
+                RestoreWallpaperIfUnloaded(ScreenId.Valkyrie, holdUntilFirstFrame);
+                RestoreWallpaperIfUnloaded(ScreenId.BoWei, holdUntilFirstFrame);
+                RestoreWallpaperIfUnloaded(ScreenId.Thermalright, holdUntilFirstFrame);
+            }
+
+            bool isStreaming;
+            lock (_lock)
+            {
+                isStreaming = _streaming;
+                _valkError = null;
+                _boweiError = null;
+                _thermalError = null;
+                _dirtyValk = true;
+                _dirtyBoWei = true;
+                _dirtyThermal = true;
+                _dirtyPreview = true;
+            }
+
+            if (isStreaming) PublishCombinedStatus();
+            else Report(true, Loc.T("st.stopped"));
+        }
+
+        private void StopAllHardwareServices()
+        {
+            try { ValkyrieDirectService.Stop(); } catch { }
+            try { BoWeiDirectService.Stop(); } catch { }
+            try { ThermalrightDirectService.Stop(); } catch { }
+        }
+
+        private void UnloadWallpaperSourceLocked(LcdScene scene)
+        {
+            if (scene != null && scene.Background == BackgroundKind.Wallpaper && scene.Source is WallpaperFrameSource)
+            {
+                ReplaceSourceLocked(scene, null);
+            }
+        }
+
+        private void RestoreWallpaperIfUnloaded(ScreenId screen, bool holdUntilFirstFrame)
+        {
+            string mediaPath;
+            Dictionary<string, string> propsCopy;
+            FitMode fit;
+            int fps;
+            lock (_lock)
+            {
+                LcdScene s = Scene(screen);
+                if (s.Background != BackgroundKind.Wallpaper || s.Source != null || string.IsNullOrEmpty(s.MediaPath))
+                    return;
+                mediaPath = s.MediaPath;
+                propsCopy = new Dictionary<string, string>(s.WallpaperProps, StringComparer.OrdinalIgnoreCase);
+                fit = s.Fit;
+            }
+            fps = EffectiveWallpaperFps(screen);
+            if (RespawnWallpaperSource(screen, mediaPath, propsCopy, fit, fps) && holdUntilFirstFrame)
+            {
+                int idx = (int)screen;
+                if (idx >= 0 && idx < _wakeHoldUntilMs.Length)
+                    _wakeHoldUntilMs[idx] = Environment.TickCount + 2500L;
+            }
+        }
+
+        private void ReloadActiveWallpapersForGpuChange()
+        {
+            foreach (ScreenId screen in new[] { ScreenId.Valkyrie, ScreenId.BoWei, ScreenId.Thermalright })
+            {
+                string mediaPath;
+                Dictionary<string, string> propsCopy;
+                FitMode fit;
+                int fps;
+                lock (_lock)
+                {
+                    LcdScene s = Scene(screen);
+                    if (s.Background != BackgroundKind.Wallpaper || s.Source == null || string.IsNullOrEmpty(s.MediaPath))
+                        continue;
+                    mediaPath = s.MediaPath;
+                    propsCopy = new Dictionary<string, string>(s.WallpaperProps, StringComparer.OrdinalIgnoreCase);
+                    fit = s.Fit;
+                }
+                fps = EffectiveWallpaperFps(screen);
+                RespawnWallpaperSource(screen, mediaPath, propsCopy, fit, fps);
+            }
+        }
+
+        private bool RespawnWallpaperSource(ScreenId screen, string mediaPath, Dictionary<string, string> propStrings, FitMode fit, int fps)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(mediaPath) || !Directory.Exists(mediaPath)) return false;
+                WallpaperEntry entry = WallpaperCatalog.TryLoadWallpaperDir(mediaPath);
+                string rendererExe = ResolvedWallpaperRendererPath();
+                if (entry == null || string.IsNullOrEmpty(rendererExe)) return false;
+
+                int rw, rh;
+                EffectiveWallpaperRenderSize(screen, out rw, out rh);
+                Dictionary<string, object> typedProps = WallpaperCatalog.ConvertPropsToTypedMap(propStrings, entry.Properties);
+                Dictionary<string, object> gpuPayload = SnapshotWallpaperGpuPayload();
+                var source = new WallpaperFrameSource(screen, rendererExe, entry.Directory, ResolvedWallpaperAssetsDir(), rw, rh, fps, typedProps, gpuPayload);
+                source.EnsureSizeAndFps(rw, rh, fps, fit);
+
+                SensorReading snapSensors = null;
+                bool installed = false;
+                lock (_lock)
+                {
+                    LcdScene s = Scene(screen);
+                    if (s.Background == BackgroundKind.Wallpaper &&
+                        string.Equals(s.MediaPath, mediaPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        ReplaceSourceLocked(s, source);
+                        installed = true;
+                        if (s.IsWebWallpaper() && _sensors != null && _sensors.Available)
+                            snapSensors = _sensors;
+                        MarkDirty(screen);
+                    }
+                }
+                if (!installed)
+                {
+                    try { source.Dispose(); } catch { }
+                    return false;
+                }
+                if (snapSensors != null)
+                    source.SetSensors(BuildSensorPayload(snapSensors));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Report(false, Loc.T("err.wallpaper") + ex.Message);
+                return false;
             }
         }
 
@@ -962,9 +1366,9 @@ namespace LcdFusion
             wpe.SetPaused(!active);
             if (active)
             {
-                int cw, ch;
-                CanvasSize(screen, out cw, out ch);
-                wpe.EnsureSizeAndFps(cw, ch, targetFps, fit);
+                int rw, rh;
+                EffectiveWallpaperRenderSize(screen, out rw, out rh);
+                wpe.EnsureSizeAndFps(rw, rh, targetFps, fit);
             }
         }
 
@@ -1155,7 +1559,9 @@ namespace LcdFusion
             using (Graphics g = Graphics.FromImage(bmp))
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.InterpolationMode = (bg == BackgroundKind.Wallpaper || bg == BackgroundKind.Gif)
+                    ? InterpolationMode.Bilinear
+                    : InterpolationMode.HighQualityBicubic;
                 g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                 g.TextRenderingHint = TextRenderingHint.AntiAlias;
 
