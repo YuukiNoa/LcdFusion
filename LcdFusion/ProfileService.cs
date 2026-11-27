@@ -62,7 +62,7 @@ namespace LcdFusion
         public int ValkyrieRotation = -1; // -1 = auto (90° for 360x960 landscape mount, 0° otherwise)
         public int BoWeiRotation;
         public int ThermalrightRotation;
-        public int BoWeiBrightness = 80;
+        public int BoWeiBrightness = 100;
         public string WallpaperAssetsDir = "";
         public string WallpaperRendererPath = "";
         public string WallpaperGpu = "auto";      // "auto" or "pci:VVVV:DDDD:ORDINAL"

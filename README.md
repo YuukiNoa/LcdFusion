@@ -19,7 +19,7 @@ LCD Fusion talks directly to the USB displays found on **Valkyrie** (Myth.Cool /
 - **Per‑screen editor** — configure Valkyrie, BoWei, and Thermalright LCDs independently (each with its own background, layers, transforms, and screen orientation).
 - **Rich backgrounds** — static image, animated GIF, **Wallpaper Engine dynamic wallpapers (`scene`, `video`, `web`)**, solid color, or none, with **rotation (any angle), mirror, zoom, `Fit` / `Fill` / `Stretch` (independent X/Y scaling and edge/corner drag), and free drag‑to‑pan**.
 - **Settings & power / iGPU optimization** — dedicated **Settings** dialog supporting **Render GPU selection** on multi‑GPU PCs (Vulkan / WebView2 / Media Foundation), **PC display‑off behavior** (`Run normally`, `Pause` closing the wallpaper renderer to 0% GPU/VRAM while keeping the last frozen frame on every LCD, or `Stop`, with auto‑resume on wake), and live‑applied **wallpaper FPS cap (`Default / 24 / 20 / 15 / 10 FPS`)** & **render resolution scaling (`100% / 75% / 60% / 50%`)** while keeping text/sensor overlays at 100% native panel sharpness.
-- **Valkyrie multi‑panel & BoWei support** — automatic/manual Valkyrie panel timing selection (`360×960`, `320×240`, `480×480`, `240×320`, `240×240`, `480×272`), plus native BoWei (`Vk-Copl-08`) `480×480` streaming with brightness control.
+- **Valkyrie multi‑panel & BoWei support** — automatic/manual Valkyrie panel timing selection (`360×960`, `320×240`), plus native BoWei (`Vk-Copl-08`) `480×480` streaming with brightness control.
 - **Layers** — movable text and **sensor widgets** (CPU/GPU temperature, load, clocks, power, GPU HotSpot / memory clock / fan %, RAM, clock, date) that you can drop **on top of any background**, each with its own size, rotation, and color. Drag on the live preview to position them.
 - **Live sensors, self‑contained** — reads CPU/GPU/RAM metrics via the bundled [LibreHardwareMonitorLib](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (with HWiNFO shared memory and WMI fallbacks); no external monitoring tool required.
 - **Profiles** — save complete multi‑screen layouts (images/GIFs embedded; wallpaper paths & custom properties persisted). The last session is restored automatically on the next launch.
@@ -32,7 +32,7 @@ LCD Fusion talks directly to the USB displays found on **Valkyrie** (Myth.Cool /
 
 | Brand / app                       | Panel / Model                           | VID / PID   | Resolution                                                          | Transport                                       |
 |-----------------------------------|-----------------------------------------|-------------|---------------------------------------------------------------------|-------------------------------------------------|
-| Valkyrie / Myth.Cool              | Valkyrie / MSDisplay LCD                | `345F:9132` | Multi‑panel (`360×960`, `320×240`, `480×480`, `240×320`, `240×240`, `480×272`) | HID init + bulk UYVY frames                     |
+| Valkyrie / Myth.Cool              | Valkyrie / MSDisplay LCD                | `345F:9132` | Multi‑panel (`360×960`, `320×240`)                                  | HID init + bulk UYVY frames                     |
 | Valkyrie / Myth.Cool (BoWei)      | Vk‑Copl‑08 Waterblock LCD               | `374A:A005` | `480 × 480`                                                         | WinUSB, raw BGR565‑LE frames (~30 fps) + brightness |
 | Thermalright / TRCC               | Thermalright AIO LCD                    | `0416:5408` | `1920 × 462`                                                        | WinUSB, JPEG frames                             |
 
@@ -114,7 +114,7 @@ MainWindow ──> ContentEngine ──> ValkyrieDirectService     (HID init + b
 ### Protocol notes
 
 - **Valkyrie (`345F:9132`)**: probes panel Flash/serial info (`ValkyrieHidInitializer`) to auto‑detect the active panel timing (or uses a user‑selected panel key from `ProductCatalog.ValkyriePanels`), sends the HID feature‑report init sequence, then streams UYVY frames over bulk endpoint `0x04` with periodic `B5 00 32` HID heartbeats (~250 ms).
-- **BoWei (`374A:A005`)**: connects via in‑box WinUSB (interface GUID `{D6A0CF3F-3825-4BD5-BB19-AAE43828058C}`, bulk OUT `0x02` / IN `0x81`), performs handshake/info commands, streams `480×480` raw BGR565‑LE frames at ~30 fps with ZLP alignment and pipe‑reset recovery, and supports live hardware brightness (`0x0002`).
+- **BoWei (`374A:A005`)**: connects via in‑box WinUSB (interface GUID `{D6A0CF3F-3825-4BD5-BB19-AAE43828058C}`, bulk OUT `0x02` / IN `0x81`), performs handshake/info commands, streams `480×480` raw BGR565‑LE frames at ~30 fps with ZLP alignment and pipe‑reset recovery, and supports live brightness control (initializes `0x0002` to 100 and scales BGR565 pixels).
 - **Thermalright (`0416:5408`)**: performs a `02 FF` handshake, then streams JPEG frames (quality 90, `1920×462`) split into 512‑byte packets over WinUSB, each frame ACKed, at a steady ~156 ms cadence.
 
 ---

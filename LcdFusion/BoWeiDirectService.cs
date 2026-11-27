@@ -17,7 +17,8 @@ namespace LcdFusion
         public const ushort Pid = 0xA005;
         public const int DefaultWidth = 480;
         public const int DefaultHeight = 480;
-        public const byte DefaultBrightness = 0x50;
+        public const byte DefaultBrightness = 100;
+        private const byte HardwareBacklightLevel = 100;
 
         private static readonly Guid InterfaceGuid = new Guid("D6A0CF3F-3825-4BD5-BB19-AAE43828058C");
         private const byte PipeOut = 0x02;
@@ -46,14 +47,17 @@ namespace LcdFusion
         private static readonly object Sync = new object();
         private static readonly ManualResetEvent FrameSent = new ManualResetEvent(false);
         private static Thread _streamThread;
+        private static byte[] _currentBgra;
+        private static int _currentBgraWidth;
+        private static int _currentBgraHeight;
         private static byte[] _currentFrame;
+        private static byte _currentFrameBrightness = DefaultBrightness;
         private static bool _stopRequested;
         private static string _streamError;
 
         private static int _width = DefaultWidth;
         private static int _height = DefaultHeight;
         private static byte _brightness = DefaultBrightness;
-        private static bool _brightnessDirty;
         private static string _detectedSerial = "";
 
         public static event Action PanelChanged;
@@ -74,9 +78,7 @@ namespace LcdFusion
             byte clamped = (byte)Math.Max(0, Math.Min(100, value));
             lock (Sync)
             {
-                if (_brightness == clamped) return;
                 _brightness = clamped;
-                _brightnessDirty = true;
             }
         }
 
@@ -95,7 +97,12 @@ namespace LcdFusion
             if (VendorService.IsMythCoolRunning())
                 return Fail(Loc.T("err.closeMythCool"));
 
-            try { return Push(BuildRgb565Frame(bgra, width, height)); }
+            try
+            {
+                byte brightness;
+                lock (Sync) { brightness = _brightness; }
+                return Push(bgra, width, height, BuildRgb565Frame(bgra, width, height, brightness), brightness);
+            }
             catch (Exception ex) { return Fail("BoWei send failed: " + ex.Message); }
         }
 
@@ -110,12 +117,16 @@ namespace LcdFusion
             if (thread != null && thread != Thread.CurrentThread) thread.Join(4000);
         }
 
-        private static DirectSendResult Push(byte[] frame)
+        private static DirectSendResult Push(byte[] bgra, int width, int height, byte[] frame, byte frameBrightness)
         {
             bool firstStart;
             lock (Sync)
             {
+                _currentBgra = bgra;
+                _currentBgraWidth = width;
+                _currentBgraHeight = height;
                 _currentFrame = frame;
+                _currentFrameBrightness = frameBrightness;
                 firstStart = _streamThread == null || !_streamThread.IsAlive;
                 if (firstStart)
                 {
@@ -180,23 +191,36 @@ namespace LcdFusion
                 while (true)
                 {
                     byte[] frame;
-                    bool sendBrightness = false;
-                    byte brightnessValue = DefaultBrightness;
+                    byte[] rebuildBgra = null;
+                    int rebuildW = 0, rebuildH = 0;
+                    byte targetBrightness = DefaultBrightness;
 
                     lock (Sync)
                     {
                         if (_stopRequested) break;
-                        frame = (_currentFrame != null && _currentFrame.Length == smemLen) ? _currentFrame : null;
-                        if (_brightnessDirty)
+                        targetBrightness = _brightness;
+                        if (_currentBgra != null && _currentFrameBrightness != targetBrightness)
                         {
-                            sendBrightness = true;
-                            brightnessValue = _brightness;
-                            _brightnessDirty = false;
+                            rebuildBgra = _currentBgra;
+                            rebuildW = _currentBgraWidth;
+                            rebuildH = _currentBgraHeight;
                         }
+                        frame = (_currentFrame != null && _currentFrame.Length == smemLen) ? _currentFrame : null;
                     }
 
-                    if (sendBrightness)
-                        SendCommand(hWinUsb, CmdSetBrightness, new[] { brightnessValue }, readBuf);
+                    if (rebuildBgra != null)
+                    {
+                        byte[] rebuilt = BuildRgb565Frame(rebuildBgra, rebuildW, rebuildH, targetBrightness);
+                        lock (Sync)
+                        {
+                            if (ReferenceEquals(_currentBgra, rebuildBgra))
+                            {
+                                _currentFrame = rebuilt;
+                                _currentFrameBrightness = targetBrightness;
+                                frame = (rebuilt.Length == smemLen) ? rebuilt : null;
+                            }
+                        }
+                    }
 
                     if (frame == null)
                     {
@@ -238,6 +262,9 @@ namespace LcdFusion
                 lock (Sync)
                 {
                     _streamThread = null;
+                    _currentBgra = null;
+                    _currentBgraWidth = 0;
+                    _currentBgraHeight = 0;
                     _currentFrame = null;
                 }
             }
@@ -273,7 +300,6 @@ namespace LcdFusion
             }
             catch { }
 
-            byte initialBrightness;
             bool dimsChanged;
             lock (Sync)
             {
@@ -281,8 +307,6 @@ namespace LcdFusion
                 dimsChanged = _width != width || _height != height;
                 _width = width;
                 _height = height;
-                initialBrightness = _brightness;
-                _brightnessDirty = false;
             }
             if (dimsChanged)
             {
@@ -290,8 +314,9 @@ namespace LcdFusion
                 if (handler != null) handler();
             }
 
-            // 4) Set brightness (Myth.Cool default 0x50)
-            SendCommand(hWinUsb, CmdSetBrightness, new[] { initialBrightness }, readBuf);
+            // 4) Keep hardware backlight at 100 (0x0002, u8 = 100); user brightness dims pixels in software
+            // because 0x0002 does not visibly adjust physical backlight on Vk-Copl-08 (see syntensa/libre-panel#69).
+            SendCommand(hWinUsb, CmdSetBrightness, new[] { HardwareBacklightLevel }, readBuf);
 
             return smemLen;
         }
@@ -422,17 +447,37 @@ namespace LcdFusion
             }
         }
 
-        private static byte[] BuildRgb565Frame(byte[] bgra, int width, int height)
+        private static byte[] BuildRgb565Frame(byte[] bgra, int width, int height, byte brightness)
         {
             int pixelCount = width * height;
             byte[] frame = new byte[pixelCount * 2];
             int dst = 0;
             int totalBytes = pixelCount * 4;
+
+            if (brightness >= 100)
+            {
+                for (int p = 0; p < totalBytes; p += 4)
+                {
+                    int b = bgra[p];
+                    int g = bgra[p + 1];
+                    int r = bgra[p + 2];
+                    // BoWei V2 480x480 panel expects BGR565 LE (bits 15..11 = B, 10..5 = G, 4..0 = R).
+                    int v = ((b & 0xF8) << 8) | ((g & 0xFC) << 3) | (r >> 3);
+                    frame[dst++] = (byte)(v & 0xFF);
+                    frame[dst++] = (byte)(v >> 8);
+                }
+                return frame;
+            }
+
+            int[] lut = new int[256];
+            for (int i = 0; i < 256; i++)
+                lut[i] = (i * brightness + 50) / 100;
+
             for (int p = 0; p < totalBytes; p += 4)
             {
-                int b = bgra[p];
-                int g = bgra[p + 1];
-                int r = bgra[p + 2];
+                int b = lut[bgra[p]];
+                int g = lut[bgra[p + 1]];
+                int r = lut[bgra[p + 2]];
                 // BoWei V2 480x480 panel expects BGR565 LE (bits 15..11 = B, 10..5 = G, 4..0 = R).
                 int v = ((b & 0xF8) << 8) | ((g & 0xFC) << 3) | (r >> 3);
                 frame[dst++] = (byte)(v & 0xFF);

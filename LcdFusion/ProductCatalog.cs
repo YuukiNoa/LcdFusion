@@ -53,10 +53,6 @@ namespace LcdFusion
         {
             new ValkyriePanelSpec(360, 960, 0xA0),
             new ValkyriePanelSpec(320, 240, 0x94),
-            new ValkyriePanelSpec(480, 480, 0x8F),
-            new ValkyriePanelSpec(240, 320, 0x93),
-            new ValkyriePanelSpec(240, 240, 0x9C),
-            new ValkyriePanelSpec(480, 272, 0x9F),
         };
 
         public static readonly LcdProduct[] Products =

@@ -186,10 +186,6 @@ internal static class ValkyrieHidInitializer
     {
         if (width == 360 && height == 960) return 0xA0;
         if (width == 320 && height == 240) return 0x94;
-        if (width == 480 && height == 480) return 0x8F;
-        if (width == 240 && height == 320) return 0x93;
-        if (width == 240 && height == 240) return 0x9C;
-        if (width == 480 && height == 272) return 0x9F;
         return 0x94;
     }
 
@@ -203,10 +199,6 @@ internal static class ValkyrieHidInitializer
         {
             { 360, 960, 0xA0 },
             { 320, 240, 0x94 },
-            { 480, 480, 0x8F },
-            { 240, 320, 0x93 },
-            { 240, 240, 0x9C },
-            { 480, 272, 0x9F },
         };
 
         string upper = serial.ToUpperInvariant();
