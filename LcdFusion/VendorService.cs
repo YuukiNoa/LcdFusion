@@ -11,16 +11,70 @@ namespace LcdFusion
         public const string MythCoolLauncher = @"C:\Program Files (x86)\Myth.Cool\MythCoolLauncher.exe";
         public const string TrccExe = @"C:\Program Files\TRCCCAP\TRCC.exe";
 
-        public static bool IsMythCoolRunning()
+        private const long CacheTtlMs = 3000;
+        private static readonly Stopwatch CacheClock = Stopwatch.StartNew();
+        private static readonly object CacheSync = new object();
+        private static long _mythCheckedMs = -CacheTtlMs;
+        private static bool _mythRunning;
+        private static long _trccCheckedMs = -CacheTtlMs;
+        private static bool _trccRunning;
+
+        public static bool IsMythCoolRunning(bool forceRefresh = false)
         {
-            return Process.GetProcessesByName("MythCool").Any();
+            long now = CacheClock.ElapsedMilliseconds;
+            lock (CacheSync)
+            {
+                if (!forceRefresh && now - _mythCheckedMs < CacheTtlMs)
+                    return _mythRunning;
+            }
+            bool running = HasProcess("MythCool");
+            lock (CacheSync)
+            {
+                _mythRunning = running;
+                _mythCheckedMs = CacheClock.ElapsedMilliseconds;
+            }
+            return running;
         }
 
-        public static bool IsTrccRunning()
+        public static bool IsTrccRunning(bool forceRefresh = false)
         {
-            return Process.GetProcessesByName("TRCC").Any() ||
-                   Process.GetProcessesByName("USBLCD").Any() ||
-                   Process.GetProcessesByName("USBLCDNEW").Any();
+            long now = CacheClock.ElapsedMilliseconds;
+            lock (CacheSync)
+            {
+                if (!forceRefresh && now - _trccCheckedMs < CacheTtlMs)
+                    return _trccRunning;
+            }
+            bool running = HasProcess("TRCC") || HasProcess("USBLCD") || HasProcess("USBLCDNEW");
+            lock (CacheSync)
+            {
+                _trccRunning = running;
+                _trccCheckedMs = CacheClock.ElapsedMilliseconds;
+            }
+            return running;
+        }
+
+        private static bool HasProcess(string name)
+        {
+            Process[] list = null;
+            try
+            {
+                list = Process.GetProcessesByName(name);
+                return list.Length > 0;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                if (list != null)
+                {
+                    for (int i = 0; i < list.Length; i++)
+                    {
+                        try { list[i].Dispose(); } catch { }
+                    }
+                }
+            }
         }
 
         public static bool LaunchMythCool()
@@ -37,7 +91,7 @@ namespace LcdFusion
         {
             try
             {
-                if (!IsMythCoolRunning() && !IsTrccRunning()) return true;
+                if (!IsMythCoolRunning(true) && !IsTrccRunning(true)) return true;
                 var info = new ProcessStartInfo("taskkill.exe",
                     "/F /IM MythCool.exe /IM TRCC.exe /IM USBLCD.exe /IM USBLCDNEW.exe");
                 info.UseShellExecute = true;
@@ -49,7 +103,7 @@ namespace LcdFusion
                     process.WaitForExit();
                 }
                 System.Threading.Thread.Sleep(500);
-                return !IsMythCoolRunning() && !IsTrccRunning();
+                return !IsMythCoolRunning(true) && !IsTrccRunning(true);
             }
             catch { return false; }
         }

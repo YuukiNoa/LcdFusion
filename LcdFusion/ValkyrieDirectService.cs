@@ -30,8 +30,10 @@ namespace LcdFusion
         private static readonly object Sync = new object();
         private static readonly ManualResetEvent FrameSent = new ManualResetEvent(false);
         private static readonly Stopwatch BackoffClock = Stopwatch.StartNew();
+        private static readonly byte[][] FramePool = new byte[3][];
         private static Thread _streamThread;
         private static byte[] _currentFrame;
+        private static byte[] _inUseFrame;
         private static int _currentFrameWidth;
         private static int _currentFrameHeight;
         private static bool _stopRequested;
@@ -165,8 +167,39 @@ namespace LcdFusion
             if (VendorService.IsMythCoolRunning())
                 return Fail(Loc.T("err.closeMythCool"));
 
-            try { return Push(BuildFrame(bgra, width, height), width, height); }
+            try
+            {
+                int frameBytes = 8 + width * height * 2 + 8;
+                byte[] targetFrame;
+                lock (Sync)
+                {
+                    targetFrame = AcquireFrameBufferLocked(frameBytes);
+                }
+                BuildFrame(bgra, width, height, targetFrame);
+                return Push(targetFrame, width, height);
+            }
             catch (Exception ex) { return Fail("Valkyrie/MSDisplay send failed: " + ex.Message); }
+        }
+
+        private static byte[] AcquireFrameBufferLocked(int neededBytes)
+        {
+            int chosen = 0;
+            for (int i = 0; i < FramePool.Length; i++)
+            {
+                byte[] slot = FramePool[i];
+                if (!ReferenceEquals(slot, _currentFrame) && !ReferenceEquals(slot, _inUseFrame))
+                {
+                    chosen = i;
+                    break;
+                }
+            }
+            byte[] buf = FramePool[chosen];
+            if (buf == null || buf.Length != neededBytes)
+            {
+                buf = new byte[neededBytes];
+                FramePool[chosen] = buf;
+            }
+            return buf;
         }
 
         public static void Stop()
@@ -271,6 +304,7 @@ namespace LcdFusion
                     {
                         if (_stopRequested) break;
                         frame = (_currentFrame != null && _currentFrame.Length == expectedLen) ? _currentFrame : null;
+                        _inUseFrame = frame;
                     }
                     if (frame == null)
                     {
@@ -281,7 +315,14 @@ namespace LcdFusion
                     }
 
                     long frameStart = sw.ElapsedMilliseconds;
-                    WriteFrameChunked(writer, frame);
+                    try
+                    {
+                        WriteFrameChunked(writer, frame);
+                    }
+                    finally
+                    {
+                        lock (Sync) { _inUseFrame = null; }
+                    }
 
                     // Mirror Myth.Cool: start scan-out right after the first frame is buffered,
                     // then issue periodic B5 00 32 keepalive every <= 250 ms between frames.
@@ -329,6 +370,7 @@ namespace LcdFusion
                 {
                     _streamThread = null;
                     _currentFrame = null;
+                    _inUseFrame = null;
                     _currentFrameWidth = 0;
                     _currentFrameHeight = 0;
                 }
@@ -355,13 +397,19 @@ namespace LcdFusion
             writer.Write(ZlpBuffer, 0, 0, 3000, out zlpTransferred);
         }
 
-        private static byte[] BuildFrame(byte[] bgra, int width, int height)
+        private static byte[] BuildFrame(byte[] bgra, int width, int height, byte[] frame)
         {
-            byte[] frame = new byte[8 + width * height * 2 + 8];
+            int expected = 8 + width * height * 2 + 8;
+            if (frame == null || frame.Length != expected)
+                frame = new byte[expected];
             // 8-byte header: FF 00 00 00 00 (W>>4) (((W&0xF)<<4)|((H>>8)&0xF)) (H&0xFF)
             //   320x240 -> FF 00 00 00 00 14 00 F0
             //   360x960 -> FF 00 00 00 00 16 83 C0
             frame[0] = 0xFF;
+            frame[1] = 0;
+            frame[2] = 0;
+            frame[3] = 0;
+            frame[4] = 0;
             frame[5] = (byte)((width >> 4) & 0xFF);
             frame[6] = (byte)(((width & 0x0F) << 4) | ((height >> 8) & 0x0F));
             frame[7] = (byte)(height & 0xFF);
@@ -394,6 +442,12 @@ namespace LcdFusion
             // 8-byte footer: FF C0 00 00 00 00 00 00
             frame[destination] = 0xFF;
             frame[destination + 1] = 0xC0;
+            frame[destination + 2] = 0;
+            frame[destination + 3] = 0;
+            frame[destination + 4] = 0;
+            frame[destination + 5] = 0;
+            frame[destination + 6] = 0;
+            frame[destination + 7] = 0;
             return frame;
         }
 

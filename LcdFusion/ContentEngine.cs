@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -148,7 +149,11 @@ namespace LcdFusion
     internal sealed class ContentEngine
     {
         private readonly object _lock = new object();
+        private readonly object _previewLock = new object();
+        private readonly Stopwatch _engineClock = Stopwatch.StartNew();
+        private readonly AutoResetEvent _sensorWake = new AutoResetEvent(false);
         private Thread _thread;
+        private Thread _sensorThread;
         private volatile bool _alive;
         private volatile bool _streaming;
 
@@ -180,7 +185,13 @@ namespace LcdFusion
         private bool _previewEnabled = true;
 
         private SensorReading _sensors = new SensorReading();
-        private byte[] _previewPng;
+        private byte[] _previewFront;
+        private byte[] _previewBack;
+        private int _previewWidth;
+        private int _previewHeight;
+        private long _previewSeq;
+        private byte[] _valkBgraBuf;
+        private byte[] _boweiBgraBuf;
         private bool _dirtyValk = true, _dirtyBoWei = true, _dirtyThermal = true, _dirtyPreview = true;
 
         private string _valkError, _boweiError, _thermalError;
@@ -299,20 +310,32 @@ namespace LcdFusion
 
         public void Start()
         {
-            if (_thread != null && _thread.IsAlive) return;
             _alive = true;
-            _thread = new Thread(Loop) { IsBackground = true, Name = "LCD Fusion Engine" };
-            _thread.Start();
+            if (_thread == null || !_thread.IsAlive)
+            {
+                _thread = new Thread(Loop) { IsBackground = true, Name = "LCD Fusion Engine" };
+                _thread.Start();
+            }
+            if (_sensorThread == null || !_sensorThread.IsAlive)
+            {
+                _sensorThread = new Thread(SensorLoop) { IsBackground = true, Name = "LCD Fusion Sensors" };
+                _sensorThread.Start();
+            }
+            _sensorWake.Set();
         }
 
         public void Shutdown()
         {
             _alive = false; _streaming = false;
+            _sensorWake.Set();
             try { ValkyrieDirectService.Stop(); } catch { }
             try { BoWeiDirectService.Stop(); } catch { }
             try { ThermalrightDirectService.Stop(); } catch { }
             Thread thread = _thread;
             if (thread != null && thread != Thread.CurrentThread) thread.Join(2000);
+            Thread sensorThread = _sensorThread;
+            if (sensorThread != null && sensorThread != Thread.CurrentThread) sensorThread.Join(2000);
+            ProcessScheduling.SetHighPerformanceMode(false);
             lock (_lock)
             {
                 _valk.DisposeSources();
@@ -367,6 +390,7 @@ namespace LcdFusion
             {
                 _screenOffBehavior = behavior;
             }
+            _sensorWake.Set();
         }
 
         public static int NormalizeWallpaperMaxFps(int fps)
@@ -441,6 +465,7 @@ namespace LcdFusion
             {
                 _displayOff = off;
             }
+            _sensorWake.Set();
         }
 
         private Dictionary<string, object> SnapshotWallpaperGpuPayload()
@@ -735,6 +760,7 @@ namespace LcdFusion
                 _previewEnabled = enabled;
                 if (enabled) _dirtyPreview = true;
             }
+            if (enabled) _sensorWake.Set();
         }
 
         public ScreenId PreviewScreen { get { lock (_lock) { return _previewScreen; } } }
@@ -764,7 +790,18 @@ namespace LcdFusion
 
         public bool IsStreaming { get { return _streaming; } }
 
-        public byte[] PreviewPng() { lock (_lock) { return _previewPng; } }
+        public bool TryConsumePreview(ref long lastSeq, Action<byte[], int, int, int> consumer)
+        {
+            if (consumer == null) return false;
+            lock (_previewLock)
+            {
+                if (_previewSeq == 0 || _previewSeq == lastSeq || _previewFront == null || _previewWidth <= 0 || _previewHeight <= 0)
+                    return false;
+                consumer(_previewFront, _previewWidth, _previewHeight, _previewWidth * 4);
+                lastSeq = _previewSeq;
+                return true;
+            }
+        }
 
         // ---- profiles ---------------------------------------------------------------
 
@@ -950,175 +987,254 @@ namespace LcdFusion
 
         // ---- engine loop ------------------------------------------------------------
 
-        private void Loop()
+        private void SensorLoop()
         {
-            long lastValk = 0, lastBoWei = 0, lastThermal = 0, lastPreview = 0, lastSensor = 0;
-            long lastTick = Environment.TickCount;
-
             while (_alive)
             {
-                long now = Environment.TickCount;
-                int delta = (int)(now - lastTick);
-                lastTick = now;
-
-                bool displayOff;
-                ScreenOffBehavior screenOffBehavior;
+                bool activeAndNeeded;
+                bool needWebPayload;
                 lock (_lock)
                 {
-                    displayOff = _displayOff;
-                    screenOffBehavior = _screenOffBehavior;
+                    bool displaySuspended = _displayOff && _screenOffBehavior != ScreenOffBehavior.RunNormally;
+                    bool anyConsumer = _streaming || _previewEnabled;
+                    bool valkNeeds = _valk.NeedsSensorData();
+                    bool boweiNeeds = _bowei.NeedsSensorData();
+                    bool thermalNeeds = _thermal.NeedsSensorData();
+                    activeAndNeeded = !displaySuspended && anyConsumer && (valkNeeds || boweiNeeds || thermalNeeds);
+                    needWebPayload = _valk.IsWebWallpaper() || _bowei.IsWebWallpaper() || _thermal.IsWebWallpaper();
                 }
 
-                ScreenOffBehavior targetOffMode = displayOff ? screenOffBehavior : ScreenOffBehavior.RunNormally;
-                if (targetOffMode != _appliedDisplayOffMode)
+                if (!activeAndNeeded)
                 {
-                    ApplyDisplayOffTransition(_appliedDisplayOffMode, targetOffMode);
-                    _appliedDisplayOffMode = targetOffMode;
-                }
-
-                if (_appliedDisplayOffMode != ScreenOffBehavior.RunNormally)
-                {
-                    lock (_lock) { DrainPendingDisposeLocked(); }
-                    Thread.Sleep(100);
+                    _sensorWake.WaitOne(500);
                     continue;
                 }
 
-                bool reloadWallpapers;
+                SensorReading r;
+                try { r = SensorService.Read(); }
+                catch { r = new SensorReading(); }
+
+                if (!_alive) break;
+
+                Dictionary<string, object> webPayload = needWebPayload ? BuildSensorPayload(r) : null;
+                WallpaperFrameSource vWpe = null, bWpe = null, tWpe = null;
                 lock (_lock)
                 {
-                    reloadWallpapers = _reloadWallpapersRequested;
-                    if (reloadWallpapers) _reloadWallpapersRequested = false;
+                    _sensors = r;
+                    if (_valk.NeedsSensorData()) _dirtyValk = true;
+                    if (_bowei.NeedsSensorData()) _dirtyBoWei = true;
+                    if (_thermal.NeedsSensorData()) _dirtyThermal = true;
+                    if (Scene(_previewScreen).NeedsSensorData()) _dirtyPreview = true;
+                    if (_valk.IsWebWallpaper()) vWpe = _valk.Source as WallpaperFrameSource;
+                    if (_bowei.IsWebWallpaper()) bWpe = _bowei.Source as WallpaperFrameSource;
+                    if (_thermal.IsWebWallpaper()) tWpe = _thermal.Source as WallpaperFrameSource;
                 }
-                if (reloadWallpapers)
+                if (webPayload != null)
                 {
-                    ReloadActiveWallpapersForGpuChange();
-                }
-
-                bool needSensors;
-                lock (_lock) { needSensors = _valk.NeedsSensorData() || _bowei.NeedsSensorData() || _thermal.NeedsSensorData(); }
-                if (needSensors && (lastSensor == 0 || now - lastSensor >= 1000))
-                {
-                    SensorReading r = SensorService.Read();
-                    Dictionary<string, object> webPayload = BuildSensorPayload(r);
-                    WallpaperFrameSource vWpe = null, bWpe = null, tWpe = null;
-                    lock (_lock)
-                    {
-                        _sensors = r;
-                        if (_valk.NeedsSensorData()) _dirtyValk = true;
-                        if (_bowei.NeedsSensorData()) _dirtyBoWei = true;
-                        if (_thermal.NeedsSensorData()) _dirtyThermal = true;
-                        if (Scene(_previewScreen).NeedsSensorData()) _dirtyPreview = true;
-                        if (_valk.IsWebWallpaper()) vWpe = _valk.Source as WallpaperFrameSource;
-                        if (_bowei.IsWebWallpaper()) bWpe = _bowei.Source as WallpaperFrameSource;
-                        if (_thermal.IsWebWallpaper()) tWpe = _thermal.Source as WallpaperFrameSource;
-                    }
                     if (vWpe != null) vWpe.SetSensors(webPayload);
                     if (bWpe != null) bWpe.SetSensors(webPayload);
                     if (tWpe != null) tWpe.SetSensors(webPayload);
-                    lastSensor = now;
                 }
 
-                lock (_lock)
-                {
-                    DrainPendingDisposeLocked();
-                    if (_valk.Source != null) _valk.Source.Advance(delta);
-                    if (_bowei.Source != null) _bowei.Source.Advance(delta);
-                    if (_thermal.Source != null) _thermal.Source.Advance(delta);
-                }
-
-                int valkInterval, boweiInterval, thermalInterval, previewInterval;
-                ScreenId previewScreen;
-                bool previewEnabled, streaming, tv, tb, tt;
-                WallpaperFrameSource valkWpe, boweiWpe, thermalWpe;
-                int valkFps, boweiFps, thermalFps;
-                FitMode valkFit, boweiFit, thermalFit;
-                lock (_lock)
-                {
-                    int fpsCap = _wallpaperMaxFps;
-                    valkFps = _valk.TargetRendererFps(ScreenId.Valkyrie);
-                    boweiFps = _bowei.TargetRendererFps(ScreenId.BoWei);
-                    thermalFps = _thermal.TargetRendererFps(ScreenId.Thermalright);
-                    if (fpsCap > 0)
-                    {
-                        if (fpsCap < valkFps) valkFps = fpsCap;
-                        if (fpsCap < boweiFps) boweiFps = fpsCap;
-                        if (fpsCap < thermalFps) thermalFps = fpsCap;
-                    }
-                    valkInterval = _valk.StreamIntervalMs(ScreenId.Valkyrie);
-                    boweiInterval = _bowei.StreamIntervalMs(ScreenId.BoWei);
-                    thermalInterval = _thermal.StreamIntervalMs(ScreenId.Thermalright);
-                    if (_valk.Background == BackgroundKind.Wallpaper && valkFps > 0)
-                        valkInterval = Math.Max(valkInterval, 1000 / valkFps);
-                    if (_bowei.Background == BackgroundKind.Wallpaper && boweiFps > 0)
-                        boweiInterval = Math.Max(boweiInterval, 1000 / boweiFps);
-                    if (_thermal.Background == BackgroundKind.Wallpaper && thermalFps > 0)
-                        thermalInterval = Math.Max(thermalInterval, 1000 / thermalFps);
-
-                    previewScreen = _previewScreen; previewEnabled = _previewEnabled; streaming = _streaming;
-                    tv = _targetValk; tb = _targetBoWei; tt = _targetThermal;
-                    previewInterval = Scene(previewScreen).PreviewIntervalMs();
-                    if (Scene(previewScreen).Background == BackgroundKind.Wallpaper)
-                    {
-                        int pf = previewScreen == ScreenId.BoWei ? boweiFps : (previewScreen == ScreenId.Thermalright ? thermalFps : valkFps);
-                        if (pf > 0) previewInterval = Math.Max(previewInterval, 1000 / pf);
-                    }
-                    valkWpe = _valk.Source as WallpaperFrameSource;
-                    boweiWpe = _bowei.Source as WallpaperFrameSource;
-                    thermalWpe = _thermal.Source as WallpaperFrameSource;
-                    valkFit = _valk.Fit;
-                    boweiFit = _bowei.Fit;
-                    thermalFit = _thermal.Fit;
-                }
-
-                SyncWallpaperSource(ScreenId.Valkyrie, valkWpe, (streaming && tv) || (previewEnabled && previewScreen == ScreenId.Valkyrie), valkFps, valkFit);
-                SyncWallpaperSource(ScreenId.BoWei, boweiWpe, (streaming && tb) || (previewEnabled && previewScreen == ScreenId.BoWei), boweiFps, boweiFit);
-                SyncWallpaperSource(ScreenId.Thermalright, thermalWpe, (streaming && tt) || (previewEnabled && previewScreen == ScreenId.Thermalright), thermalFps, thermalFit);
-                SyncWallpaperErrors(valkWpe, boweiWpe, thermalWpe, streaming, tv, tb, tt, previewEnabled, previewScreen);
-
-                WallpaperFrameSource previewWpe = previewScreen == ScreenId.BoWei ? boweiWpe : (previewScreen == ScreenId.Thermalright ? thermalWpe : valkWpe);
-                bool previewHasNewWallpaperFrame = previewWpe == null || previewWpe.HasPendingFrame || previewWpe.LastFrameSequence != _lastPreviewSeq || _lastPreviewSeqScreen != previewScreen;
-                if (previewEnabled && (_dirtyPreview || (ShouldRefresh(now, lastPreview, previewInterval) && previewHasNewWallpaperFrame)))
-                {
-                    RenderPreview(previewScreen);
-                    lastPreview = now;
-                    _dirtyPreview = false;
-                    if (previewWpe != null)
-                    {
-                        _lastPreviewSeq = previewWpe.LastFrameSequence;
-                        _lastPreviewSeqScreen = previewScreen;
-                    }
-                }
-
-                if (streaming)
-                {
-                    bool valkHasNew = valkWpe == null || valkWpe.HasPendingFrame || valkWpe.LastFrameSequence != _lastStreamedSeq[0];
-                    if (tv && !IsWaitingForWallpaperFirstFrame(ScreenId.Valkyrie, valkWpe, now) && (_dirtyValk || (ShouldRefresh(now, lastValk, valkInterval) && valkHasNew)))
-                    {
-                        PushValkyrie();
-                        lastValk = now;
-                        _dirtyValk = false;
-                        if (valkWpe != null) _lastStreamedSeq[0] = valkWpe.LastFrameSequence;
-                    }
-                    bool boweiHasNew = boweiWpe == null || boweiWpe.HasPendingFrame || boweiWpe.LastFrameSequence != _lastStreamedSeq[1];
-                    if (tb && !IsWaitingForWallpaperFirstFrame(ScreenId.BoWei, boweiWpe, now) && (_dirtyBoWei || (ShouldRefresh(now, lastBoWei, boweiInterval) && boweiHasNew)))
-                    {
-                        PushBoWei();
-                        lastBoWei = now;
-                        _dirtyBoWei = false;
-                        if (boweiWpe != null) _lastStreamedSeq[1] = boweiWpe.LastFrameSequence;
-                    }
-                    bool thermalHasNew = thermalWpe == null || thermalWpe.HasPendingFrame || thermalWpe.LastFrameSequence != _lastStreamedSeq[2];
-                    if (tt && !IsWaitingForWallpaperFirstFrame(ScreenId.Thermalright, thermalWpe, now) && (_dirtyThermal || (ShouldRefresh(now, lastThermal, thermalInterval) && thermalHasNew)))
-                    {
-                        PushThermalright();
-                        lastThermal = now;
-                        _dirtyThermal = false;
-                        if (thermalWpe != null) _lastStreamedSeq[2] = thermalWpe.LastFrameSequence;
-                    }
-                }
-
-                Thread.Sleep(15);
+                _sensorWake.WaitOne(1000);
             }
+        }
+
+        private void Loop()
+        {
+            long lastValk = 0, lastBoWei = 0, lastThermal = 0, lastPreview = 0;
+            long lastTick = _engineClock.ElapsedMilliseconds;
+
+            try
+            {
+                while (_alive)
+                {
+                    long now = _engineClock.ElapsedMilliseconds;
+                    int delta = (int)Math.Max(0, Math.Min(int.MaxValue, now - lastTick));
+                    lastTick = now;
+
+                    bool displayOff;
+                    ScreenOffBehavior screenOffBehavior;
+                    lock (_lock)
+                    {
+                        displayOff = _displayOff;
+                        screenOffBehavior = _screenOffBehavior;
+                    }
+
+                    ScreenOffBehavior targetOffMode = displayOff ? screenOffBehavior : ScreenOffBehavior.RunNormally;
+                    if (targetOffMode != _appliedDisplayOffMode)
+                    {
+                        ApplyDisplayOffTransition(_appliedDisplayOffMode, targetOffMode);
+                        _appliedDisplayOffMode = targetOffMode;
+                    }
+
+                    if (_appliedDisplayOffMode != ScreenOffBehavior.RunNormally)
+                    {
+                        ProcessScheduling.SetHighPerformanceMode(false);
+                        lock (_lock) { DrainPendingDisposeLocked(); }
+                        Thread.Sleep(100);
+                        continue;
+                    }
+
+                    bool reloadWallpapers;
+                    lock (_lock)
+                    {
+                        reloadWallpapers = _reloadWallpapersRequested;
+                        if (reloadWallpapers) _reloadWallpapersRequested = false;
+                    }
+                    if (reloadWallpapers)
+                    {
+                        ReloadActiveWallpapersForGpuChange();
+                    }
+
+                    lock (_lock)
+                    {
+                        DrainPendingDisposeLocked();
+                        if (_valk.Source != null) _valk.Source.Advance(delta);
+                        if (_bowei.Source != null) _bowei.Source.Advance(delta);
+                        if (_thermal.Source != null) _thermal.Source.Advance(delta);
+                    }
+
+                    int valkInterval, boweiInterval, thermalInterval, previewInterval;
+                    ScreenId previewScreen;
+                    bool previewEnabled, streaming, tv, tb, tt;
+                    WallpaperFrameSource valkWpe, boweiWpe, thermalWpe;
+                    int valkFps, boweiFps, thermalFps;
+                    FitMode valkFit, boweiFit, thermalFit;
+                    lock (_lock)
+                    {
+                        int fpsCap = _wallpaperMaxFps;
+                        valkFps = _valk.TargetRendererFps(ScreenId.Valkyrie);
+                        boweiFps = _bowei.TargetRendererFps(ScreenId.BoWei);
+                        thermalFps = _thermal.TargetRendererFps(ScreenId.Thermalright);
+                        if (fpsCap > 0)
+                        {
+                            if (fpsCap < valkFps) valkFps = fpsCap;
+                            if (fpsCap < boweiFps) boweiFps = fpsCap;
+                            if (fpsCap < thermalFps) thermalFps = fpsCap;
+                        }
+                        valkInterval = _valk.StreamIntervalMs(ScreenId.Valkyrie);
+                        boweiInterval = _bowei.StreamIntervalMs(ScreenId.BoWei);
+                        thermalInterval = _thermal.StreamIntervalMs(ScreenId.Thermalright);
+                        if (_valk.Background == BackgroundKind.Wallpaper && valkFps > 0)
+                            valkInterval = Math.Max(valkInterval, 1000 / valkFps);
+                        if (_bowei.Background == BackgroundKind.Wallpaper && boweiFps > 0)
+                            boweiInterval = Math.Max(boweiInterval, 1000 / boweiFps);
+                        if (_thermal.Background == BackgroundKind.Wallpaper && thermalFps > 0)
+                            thermalInterval = Math.Max(thermalInterval, 1000 / thermalFps);
+
+                        previewScreen = _previewScreen; previewEnabled = _previewEnabled; streaming = _streaming;
+                        tv = _targetValk; tb = _targetBoWei; tt = _targetThermal;
+                        previewInterval = Scene(previewScreen).PreviewIntervalMs();
+                        if (Scene(previewScreen).Background == BackgroundKind.Wallpaper)
+                        {
+                            int pf = previewScreen == ScreenId.BoWei ? boweiFps : (previewScreen == ScreenId.Thermalright ? thermalFps : valkFps);
+                            if (pf > 0) previewInterval = Math.Max(previewInterval, 1000 / pf);
+                        }
+                        valkWpe = _valk.Source as WallpaperFrameSource;
+                        boweiWpe = _bowei.Source as WallpaperFrameSource;
+                        thermalWpe = _thermal.Source as WallpaperFrameSource;
+                        valkFit = _valk.Fit;
+                        boweiFit = _bowei.Fit;
+                        thermalFit = _thermal.Fit;
+                    }
+
+                    ProcessScheduling.SetHighPerformanceMode(streaming && (tv || tb || tt));
+
+                    SyncWallpaperSource(ScreenId.Valkyrie, valkWpe, (streaming && tv) || (previewEnabled && previewScreen == ScreenId.Valkyrie), valkFps, valkFit);
+                    SyncWallpaperSource(ScreenId.BoWei, boweiWpe, (streaming && tb) || (previewEnabled && previewScreen == ScreenId.BoWei), boweiFps, boweiFit);
+                    SyncWallpaperSource(ScreenId.Thermalright, thermalWpe, (streaming && tt) || (previewEnabled && previewScreen == ScreenId.Thermalright), thermalFps, thermalFit);
+                    SyncWallpaperErrors(valkWpe, boweiWpe, thermalWpe, streaming, tv, tb, tt, previewEnabled, previewScreen);
+
+                    WallpaperFrameSource previewWpe = previewScreen == ScreenId.BoWei ? boweiWpe : (previewScreen == ScreenId.Thermalright ? thermalWpe : valkWpe);
+                    bool previewHasNewWallpaperFrame = previewWpe == null || previewWpe.HasPendingFrame || previewWpe.LastFrameSequence != _lastPreviewSeq || _lastPreviewSeqScreen != previewScreen;
+                    if (previewEnabled && (_dirtyPreview || (ShouldRefresh(now, lastPreview, previewInterval) && previewHasNewWallpaperFrame)))
+                    {
+                        RenderPreview(previewScreen);
+                        lastPreview = now;
+                        _dirtyPreview = false;
+                        if (previewWpe != null)
+                        {
+                            _lastPreviewSeq = previewWpe.LastFrameSequence;
+                            _lastPreviewSeqScreen = previewScreen;
+                        }
+                    }
+
+                    if (streaming)
+                    {
+                        bool valkHasNew = valkWpe == null || valkWpe.HasPendingFrame || valkWpe.LastFrameSequence != _lastStreamedSeq[0];
+                        if (tv && !IsWaitingForWallpaperFirstFrame(ScreenId.Valkyrie, valkWpe, now) && (_dirtyValk || (ShouldRefresh(now, lastValk, valkInterval) && valkHasNew)))
+                        {
+                            PushValkyrie();
+                            lastValk = now;
+                            _dirtyValk = false;
+                            if (valkWpe != null) _lastStreamedSeq[0] = valkWpe.LastFrameSequence;
+                        }
+                        bool boweiHasNew = boweiWpe == null || boweiWpe.HasPendingFrame || boweiWpe.LastFrameSequence != _lastStreamedSeq[1];
+                        if (tb && !IsWaitingForWallpaperFirstFrame(ScreenId.BoWei, boweiWpe, now) && (_dirtyBoWei || (ShouldRefresh(now, lastBoWei, boweiInterval) && boweiHasNew)))
+                        {
+                            PushBoWei();
+                            lastBoWei = now;
+                            _dirtyBoWei = false;
+                            if (boweiWpe != null) _lastStreamedSeq[1] = boweiWpe.LastFrameSequence;
+                        }
+                        bool thermalHasNew = thermalWpe == null || thermalWpe.HasPendingFrame || thermalWpe.LastFrameSequence != _lastStreamedSeq[2];
+                        if (tt && !IsWaitingForWallpaperFirstFrame(ScreenId.Thermalright, thermalWpe, now) && (_dirtyThermal || (ShouldRefresh(now, lastThermal, thermalInterval) && thermalHasNew)))
+                        {
+                            PushThermalright();
+                            lastThermal = now;
+                            _dirtyThermal = false;
+                            if (thermalWpe != null) _lastStreamedSeq[2] = thermalWpe.LastFrameSequence;
+                        }
+                    }
+
+                    int sleepMs = ComputeLoopSleepMs(
+                        _engineClock.ElapsedMilliseconds,
+                        previewEnabled, lastPreview, previewInterval,
+                        streaming && tv, lastValk, valkInterval,
+                        streaming && tb, lastBoWei, boweiInterval,
+                        streaming && tt, lastThermal, thermalInterval);
+                    Thread.Sleep(sleepMs);
+                }
+            }
+            finally
+            {
+                ProcessScheduling.SetHighPerformanceMode(false);
+            }
+        }
+
+        private static int ComputeLoopSleepMs(
+            long now,
+            bool previewActive, long lastPreview, int previewInterval,
+            bool valkActive, long lastValk, int valkInterval,
+            bool boweiActive, long lastBoWei, int boweiInterval,
+            bool thermalActive, long lastThermal, int thermalInterval)
+        {
+            long minWait = 50;
+            bool anyFast = false;
+
+            AccumulateWait(now, previewActive, lastPreview, previewInterval, ref minWait, ref anyFast);
+            AccumulateWait(now, valkActive, lastValk, valkInterval, ref minWait, ref anyFast);
+            AccumulateWait(now, boweiActive, lastBoWei, boweiInterval, ref minWait, ref anyFast);
+            AccumulateWait(now, thermalActive, lastThermal, thermalInterval, ref minWait, ref anyFast);
+
+            if (anyFast)
+            {
+                if (minWait <= 0) return 4;
+                if (minWait > 12) return 12;
+                return (int)minWait;
+            }
+            if (minWait <= 5) return 5;
+            if (minWait > 50) return 50;
+            return (int)minWait;
+        }
+
+        private static void AccumulateWait(long now, bool active, long last, int interval, ref long minWait, ref bool anyFast)
+        {
+            if (!active || interval == int.MaxValue) return;
+            if (interval <= 200) anyFast = true;
+            long wait = (last + interval) - now;
+            if (wait < minWait) minWait = wait;
         }
 
         private bool IsWaitingForWallpaperFirstFrame(ScreenId screen, WallpaperFrameSource wpe, long now)
@@ -1230,7 +1346,7 @@ namespace LcdFusion
             {
                 int idx = (int)screen;
                 if (idx >= 0 && idx < _wakeHoldUntilMs.Length)
-                    _wakeHoldUntilMs[idx] = Environment.TickCount + 2500L;
+                    _wakeHoldUntilMs[idx] = _engineClock.ElapsedMilliseconds + 2500L;
             }
         }
 
@@ -1389,7 +1505,7 @@ namespace LcdFusion
                 using (Bitmap bmp = RenderScene(ScreenId.Valkyrie, canvasW, canvasH))
                 {
                     ApplyHardwareRotation(bmp, rot);
-                    DirectSendResult result = ValkyrieDirectService.ShowBgra(BgraFromBitmap(bmp), wireW, wireH);
+                    DirectSendResult result = ValkyrieDirectService.ShowBgra(BgraFromBitmap(bmp, ref _valkBgraBuf), wireW, wireH);
                     RecordScreenStatus(ScreenId.Valkyrie, result.Success ? null : "Valkyrie: " + result.Message);
                 }
             }
@@ -1408,7 +1524,7 @@ namespace LcdFusion
                 using (Bitmap bmp = RenderScene(ScreenId.BoWei, canvasW, canvasH))
                 {
                     ApplyHardwareRotation(bmp, rot);
-                    DirectSendResult result = BoWeiDirectService.ShowBgra(BgraFromBitmap(bmp), wireW, wireH);
+                    DirectSendResult result = BoWeiDirectService.ShowBgra(BgraFromBitmap(bmp, ref _boweiBgraBuf), wireW, wireH);
                     RecordScreenStatus(ScreenId.BoWei, result.Success ? null : "BoWei: " + result.Message);
                 }
             }
@@ -1513,11 +1629,17 @@ namespace LcdFusion
                 int w = Math.Max(1, (int)Math.Round(canvasW * sc));
                 int h = Math.Max(1, (int)Math.Round(canvasH * sc));
                 using (Bitmap bmp = RenderScene(screen, w, h))
-                using (MemoryStream stream = new MemoryStream())
                 {
-                    bmp.Save(stream, ImageFormat.Png);
-                    byte[] png = stream.ToArray();
-                    lock (_lock) { _previewPng = png; }
+                    BgraFromBitmap(bmp, ref _previewBack);
+                    lock (_previewLock)
+                    {
+                        byte[] swap = _previewFront;
+                        _previewFront = _previewBack;
+                        _previewBack = swap;
+                        _previewWidth = w;
+                        _previewHeight = h;
+                        _previewSeq++;
+                    }
                 }
             }
             catch { }
@@ -1733,16 +1855,25 @@ namespace LcdFusion
 
         // ---- pixel access -----------------------------------------------------------
 
-        private static byte[] BgraFromBitmap(Bitmap bmp)
+        private static byte[] BgraFromBitmap(Bitmap bmp, ref byte[] buffer)
         {
             Rectangle rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
             BitmapData data = bmp.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
             try
             {
                 int rowBytes = bmp.Width * 4;
-                byte[] buffer = new byte[rowBytes * bmp.Height];
-                for (int y = 0; y < bmp.Height; y++)
-                    Marshal.Copy(IntPtr.Add(data.Scan0, y * data.Stride), buffer, y * rowBytes, rowBytes);
+                int totalBytes = rowBytes * bmp.Height;
+                if (buffer == null || buffer.Length != totalBytes)
+                    buffer = new byte[totalBytes];
+                if (data.Stride == rowBytes)
+                {
+                    Marshal.Copy(data.Scan0, buffer, 0, totalBytes);
+                }
+                else
+                {
+                    for (int y = 0; y < bmp.Height; y++)
+                        Marshal.Copy(IntPtr.Add(data.Scan0, y * data.Stride), buffer, y * rowBytes, rowBytes);
+                }
                 return buffer;
             }
             finally { bmp.UnlockBits(data); }

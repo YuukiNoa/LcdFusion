@@ -87,7 +87,12 @@ namespace LcdFusion
         private TextBlock _profileDirtyText;
 
         private DeviceSnapshot _snapshot;
-        private byte[] _lastPng;
+        private WriteableBitmap _previewBitmap;
+        private long _lastPreviewSeq;
+        private bool _renderingHooked;
+        private bool _previewOccluded;
+        private long _lastStatusRefreshMs = -10000;
+        private readonly System.Diagnostics.Stopwatch _uiClock = System.Diagnostics.Stopwatch.StartNew();
         private ComboBox _profileCombo;
         private CheckBox _autoStartCheck;
         private bool _autoStart;
@@ -218,9 +223,14 @@ namespace LcdFusion
             BoWeiDirectService.PanelChanged += OnHardwarePanelChanged;
             Loc.Changed += OnLanguageChanged;
             _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1500) };
-            _timer.Tick += delegate { RefreshStatus(); };
+            _timer.Tick += OnStatusTimerTick;
             _timer.Start();
-            CompositionTarget.Rendering += OnRender;
+            SetRenderingHooked(true);
+            Activated += delegate { OnWindowVisibilityOrFocusChanged(true); };
+            Deactivated += delegate { OnWindowVisibilityOrFocusChanged(false); };
+            IsVisibleChanged += delegate { OnWindowVisibilityOrFocusChanged(false); };
+            LocationChanged += delegate { if (!IsActive) UpdatePreviewVisibility(); };
+            SizeChanged += delegate { if (!IsActive) UpdatePreviewVisibility(); };
             RefreshStatus();
             SetupTray();
             Loaded += OnWindowLoaded;
@@ -270,6 +280,8 @@ namespace LcdFusion
         private void OnLanguageChanged()
         {
             Content = BuildUi();
+            _lastPreviewSeq = 0;
+            if (_preview != null && _previewBitmap != null) _preview.Source = _previewBitmap;
             RebuildEditor();
             ApplyPreviewAspect();
             _engine.SetPreviewTarget(_activeScreen);
@@ -306,8 +318,13 @@ namespace LcdFusion
         private void OnStateChanged(object sender, EventArgs e)
         {
             UpdateWindowChromeState();
-            if (WindowState != WindowState.Minimized || _tray == null) return;
-            _engine.SetPreviewEnabled(false);
+            if (WindowState != WindowState.Minimized || _tray == null)
+            {
+                UpdatePreviewVisibility();
+                return;
+            }
+            _timer.Stop();
+            SetPreviewActive(false);
             Hide();
             _tray.Visible = true;
             if (!_trayHinted)
@@ -404,11 +421,12 @@ namespace LcdFusion
         private void RestoreFromTray()
         {
             if (_tray != null) _tray.Visible = false;
-            _engine.SetPreviewEnabled(true);
+            _timer.Start();
             Show();
             WindowState = WindowState.Normal;
             Activate();
             Topmost = true; Topmost = false;
+            OnWindowVisibilityOrFocusChanged(true);
         }
 
         // ---- layout -----------------------------------------------------------------
@@ -3017,23 +3035,131 @@ namespace LcdFusion
 
         private void OnRender(object sender, EventArgs e)
         {
-            byte[] png = _engine.PreviewPng();
-            if (png == null || ReferenceEquals(png, _lastPng)) return;
-            _lastPng = png;
+            _engine.TryConsumePreview(ref _lastPreviewSeq, UpdatePreviewBitmap);
+        }
+
+        private void UpdatePreviewBitmap(byte[] bgra, int width, int height, int stride)
+        {
+            if (_preview == null || bgra == null || width <= 0 || height <= 0) return;
             try
             {
-                using (var ms = new MemoryStream(png))
+                if (_previewBitmap == null || _previewBitmap.PixelWidth != width || _previewBitmap.PixelHeight != height)
                 {
-                    var image = new BitmapImage();
-                    image.BeginInit();
-                    image.CacheOption = BitmapCacheOption.OnLoad;
-                    image.StreamSource = ms;
-                    image.EndInit();
-                    image.Freeze();
-                    _preview.Source = image;
+                    _previewBitmap = new WriteableBitmap(width, height, 96, 96, PixelFormats.Bgra32, null);
+                    _preview.Source = _previewBitmap;
                 }
+                else if (!ReferenceEquals(_preview.Source, _previewBitmap))
+                {
+                    _preview.Source = _previewBitmap;
+                }
+                _previewBitmap.WritePixels(new Int32Rect(0, 0, width, height), bgra, stride, 0);
             }
             catch { }
+        }
+
+        private void SetRenderingHooked(bool hooked)
+        {
+            if (_renderingHooked == hooked) return;
+            _renderingHooked = hooked;
+            if (hooked) CompositionTarget.Rendering += OnRender;
+            else CompositionTarget.Rendering -= OnRender;
+        }
+
+        private void SetPreviewActive(bool active)
+        {
+            _previewOccluded = !active;
+            _engine.SetPreviewEnabled(active);
+            SetRenderingHooked(active);
+        }
+
+        private void OnWindowVisibilityOrFocusChanged(bool becameActive)
+        {
+            UpdatePreviewVisibility();
+            if (becameActive && (_uiClock.ElapsedMilliseconds - _lastStatusRefreshMs >= 2000))
+                RefreshStatus();
+        }
+
+        private void UpdatePreviewVisibility()
+        {
+            if (!IsVisible || WindowState == WindowState.Minimized)
+            {
+                SetPreviewActive(false);
+                return;
+            }
+            if (IsActive)
+            {
+                SetPreviewActive(true);
+                return;
+            }
+            IntPtr hwnd = new WindowInteropHelper(this).Handle;
+            bool occluded = hwnd != IntPtr.Zero && IsWindowCompletelyOccluded(hwnd);
+            SetPreviewActive(!occluded);
+        }
+
+        private void OnStatusTimerTick(object sender, EventArgs e)
+        {
+            UpdatePreviewVisibility();
+            if (!IsVisible || WindowState == WindowState.Minimized || _previewOccluded) return;
+            if (_uiClock.ElapsedMilliseconds - _lastStatusRefreshMs < 3000) return;
+            RefreshStatus();
+        }
+
+        private const uint GW_HWNDPREV = 3;
+        private const int GWL_EXSTYLE = -20;
+        private const long WS_EX_TRANSPARENT = 0x00000020L;
+        private const long WS_EX_TOOLWINDOW = 0x00000080L;
+        private const long WS_EX_LAYERED = 0x00080000L;
+        private const int DWMWA_CLOAKED = 14;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WinRect { public int Left, Top, Right, Bottom; }
+
+        [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hWnd, out WinRect lpRect);
+        [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] private static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
+        [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);
+
+        private static bool IsWindowCloaked(IntPtr hwnd)
+        {
+            int cloaked = 0;
+            try { return DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, out cloaked, sizeof(int)) == 0 && cloaked != 0; }
+            catch { return false; }
+        }
+
+        private static bool IsWindowCompletelyOccluded(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero || !IsWindowVisible(hwnd) || IsIconic(hwnd) || IsWindowCloaked(hwnd))
+                return true;
+
+            WinRect selfRect;
+            if (!GetWindowRect(hwnd, out selfRect) || selfRect.Right <= selfRect.Left || selfRect.Bottom <= selfRect.Top)
+                return true;
+
+            // Walk top-level windows above ours in Z-order; if any opaque normal window fully covers us,
+            // pause live preview rendering & WPF CompositionTarget.Rendering until visible again.
+            IntPtr cur = GetWindow(hwnd, GW_HWNDPREV);
+            int guard = 0;
+            while (cur != IntPtr.Zero && guard++ < 256)
+            {
+                if (IsWindowVisible(cur) && !IsIconic(cur) && !IsWindowCloaked(cur))
+                {
+                    long exStyle = GetWindowLongPtr64(cur, GWL_EXSTYLE).ToInt64();
+                    if ((exStyle & (WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW)) == 0)
+                    {
+                        WinRect other;
+                        if (GetWindowRect(cur, out other) &&
+                            other.Left <= selfRect.Left && other.Top <= selfRect.Top &&
+                            other.Right >= selfRect.Right && other.Bottom >= selfRect.Bottom)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                cur = GetWindow(cur, GW_HWNDPREV);
+            }
+            return false;
         }
 
         private void ApplyPreviewAspect()
@@ -3071,6 +3197,7 @@ namespace LcdFusion
         {
             if (_refreshing) return;
             _refreshing = true;
+            _lastStatusRefreshMs = _uiClock.ElapsedMilliseconds;
             ThreadPool.QueueUserWorkItem(delegate
             {
                 DeviceSnapshot snap = null;
@@ -3078,8 +3205,8 @@ namespace LcdFusion
                 try
                 {
                     snap = DeviceService.Read();
-                    myth = VendorService.IsMythCoolRunning();
-                    trcc = VendorService.IsTrccRunning();
+                    myth = VendorService.IsMythCoolRunning(true);
+                    trcc = VendorService.IsTrccRunning(true);
                     if (snap != null && snap.Valkyrie.IsHealthy && !myth && !_valkProbedThisSession && ValkyrieDirectService.IsAutoMode)
                     {
                         ValkyrieDirectService.TryProbePanel();
@@ -3330,7 +3457,8 @@ namespace LcdFusion
             ValkyrieDirectService.PanelChanged -= OnHardwarePanelChanged;
             BoWeiDirectService.PanelChanged -= OnHardwarePanelChanged;
             Loc.Changed -= OnLanguageChanged;
-            CompositionTarget.Rendering -= OnRender;
+            _timer.Stop();
+            SetRenderingHooked(false);
             _engine.Shutdown();
             SensorService.Close();
             UsbDevice.Exit();

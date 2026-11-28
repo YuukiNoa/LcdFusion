@@ -50,21 +50,24 @@ namespace LcdFusion
                 {
                     foreach (ManagementObject item in results)
                     {
-                        var id = Convert.ToString(item["PNPDeviceID"]);
-                        var name = Convert.ToString(item["Name"]);
-                        var code = ToUInt(item["ConfigManagerErrorCode"]);
+                        using (item)
+                        {
+                            var id = Convert.ToString(item["PNPDeviceID"]);
+                            var name = Convert.ToString(item["Name"]);
+                            var code = ToUInt(item["ConfigManagerErrorCode"]);
 
-                        if (Contains(id, ValkyrieId))
-                            Update(snapshot.Valkyrie, id, name, code);
-                        if (Contains(id, BoWeiId))
-                            Update(snapshot.BoWei, id, name, code);
-                        if (Contains(id, ThermalrightId))
-                            Update(snapshot.Thermalright, id, name, code);
-                        if (Contains(id, "VID_0000&PID_0002") ||
-                            Contains(name, "descrittore dispositivo non riuscita") ||
-                            Contains(name, "Device Descriptor Request Failed") ||
-                            Contains(name, "设备描述符请求失败"))
-                            snapshot.DescriptorFailure = true;
+                            if (Contains(id, ValkyrieId))
+                                Update(snapshot.Valkyrie, id, name, code);
+                            if (Contains(id, BoWeiId))
+                                Update(snapshot.BoWei, id, name, code);
+                            if (Contains(id, ThermalrightId))
+                                Update(snapshot.Thermalright, id, name, code);
+                            if (Contains(id, "VID_0000&PID_0002") ||
+                                Contains(name, "descrittore dispositivo non riuscita") ||
+                                Contains(name, "Device Descriptor Request Failed") ||
+                                Contains(name, "设备描述符请求失败"))
+                                snapshot.DescriptorFailure = true;
+                        }
                     }
                 }
             }

@@ -45,13 +45,21 @@ namespace LcdFusion
         private const uint FileFlagOverlapped = 0x40000000;
 
         private static readonly object Sync = new object();
+        private static readonly object LutSync = new object();
         private static readonly ManualResetEvent FrameSent = new ManualResetEvent(false);
+        private static readonly byte[][] FramePool = new byte[4][];
+        private static readonly byte[][] BgraPool = new byte[3][];
         private static Thread _streamThread;
         private static byte[] _currentBgra;
+        private static byte[] _inUseBgra;
         private static int _currentBgraWidth;
         private static int _currentBgraHeight;
         private static byte[] _currentFrame;
+        private static byte[] _inUseFrame;
+        private static byte[] _buildingFrame;
         private static byte _currentFrameBrightness = DefaultBrightness;
+        private static int _cachedLutBrightness = -1;
+        private static int[] _cachedLut5;
         private static bool _stopRequested;
         private static string _streamError;
 
@@ -97,13 +105,80 @@ namespace LcdFusion
             if (VendorService.IsMythCoolRunning())
                 return Fail(Loc.T("err.closeMythCool"));
 
+            byte[] targetFrame = null;
             try
             {
                 byte brightness;
-                lock (Sync) { brightness = _brightness; }
-                return Push(bgra, width, height, BuildRgb565Frame(bgra, width, height, brightness), brightness);
+                byte[] bgraCopy;
+                int bgraBytes = width * height * 4;
+                int frameBytes = width * height * 2;
+                lock (Sync)
+                {
+                    brightness = _brightness;
+                    targetFrame = AcquireFrameBufferLocked(frameBytes, true);
+                    bgraCopy = AcquireBgraBufferLocked(bgraBytes);
+                }
+                Buffer.BlockCopy(bgra, 0, bgraCopy, 0, bgraBytes);
+                BuildRgb565Frame(bgraCopy, width, height, brightness, targetFrame);
+                return Push(bgraCopy, width, height, targetFrame, brightness);
             }
             catch (Exception ex) { return Fail("BoWei send failed: " + ex.Message); }
+            finally
+            {
+                if (targetFrame != null)
+                {
+                    lock (Sync)
+                    {
+                        if (ReferenceEquals(_buildingFrame, targetFrame))
+                            _buildingFrame = null;
+                    }
+                }
+            }
+        }
+
+        private static byte[] AcquireFrameBufferLocked(int neededBytes, bool markAsBuilding)
+        {
+            int chosen = 0;
+            for (int i = 0; i < FramePool.Length; i++)
+            {
+                byte[] slot = FramePool[i];
+                if (!ReferenceEquals(slot, _currentFrame) &&
+                    !ReferenceEquals(slot, _inUseFrame) &&
+                    !ReferenceEquals(slot, _buildingFrame))
+                {
+                    chosen = i;
+                    break;
+                }
+            }
+            byte[] buf = FramePool[chosen];
+            if (buf == null || buf.Length != neededBytes)
+            {
+                buf = new byte[neededBytes];
+                FramePool[chosen] = buf;
+            }
+            if (markAsBuilding) _buildingFrame = buf;
+            return buf;
+        }
+
+        private static byte[] AcquireBgraBufferLocked(int neededBytes)
+        {
+            int chosen = 0;
+            for (int i = 0; i < BgraPool.Length; i++)
+            {
+                byte[] slot = BgraPool[i];
+                if (!ReferenceEquals(slot, _currentBgra) && !ReferenceEquals(slot, _inUseBgra))
+                {
+                    chosen = i;
+                    break;
+                }
+            }
+            byte[] buf = BgraPool[chosen];
+            if (buf == null || buf.Length != neededBytes)
+            {
+                buf = new byte[neededBytes];
+                BgraPool[chosen] = buf;
+            }
+            return buf;
         }
 
         public static void Stop()
@@ -192,6 +267,7 @@ namespace LcdFusion
                 {
                     byte[] frame;
                     byte[] rebuildBgra = null;
+                    byte[] rebuildDst = null;
                     int rebuildW = 0, rebuildH = 0;
                     byte targetBrightness = DefaultBrightness;
 
@@ -204,43 +280,66 @@ namespace LcdFusion
                             rebuildBgra = _currentBgra;
                             rebuildW = _currentBgraWidth;
                             rebuildH = _currentBgraHeight;
+                            _inUseBgra = rebuildBgra;
+                            rebuildDst = AcquireFrameBufferLocked(rebuildW * rebuildH * 2, false);
+                            _inUseFrame = rebuildDst;
                         }
                         frame = (_currentFrame != null && _currentFrame.Length == smemLen) ? _currentFrame : null;
+                        if (rebuildBgra == null) _inUseFrame = frame;
                     }
 
                     if (rebuildBgra != null)
                     {
-                        byte[] rebuilt = BuildRgb565Frame(rebuildBgra, rebuildW, rebuildH, targetBrightness);
+                        try
+                        {
+                            BuildRgb565Frame(rebuildBgra, rebuildW, rebuildH, targetBrightness, rebuildDst);
+                        }
+                        finally
+                        {
+                            lock (Sync) { _inUseBgra = null; }
+                        }
                         lock (Sync)
                         {
                             if (ReferenceEquals(_currentBgra, rebuildBgra))
                             {
-                                _currentFrame = rebuilt;
+                                _currentFrame = rebuildDst;
                                 _currentFrameBrightness = targetBrightness;
-                                frame = (rebuilt.Length == smemLen) ? rebuilt : null;
+                                frame = (rebuildDst.Length == smemLen) ? rebuildDst : null;
                             }
+                            else
+                            {
+                                frame = (_currentFrame != null && _currentFrame.Length == smemLen) ? _currentFrame : null;
+                            }
+                            _inUseFrame = frame;
                         }
                     }
 
                     if (frame == null)
                     {
+                        lock (Sync) { _inUseFrame = null; }
                         FrameSent.Set();
                         Thread.Sleep(20);
                         continue;
                     }
 
                     long frameStart = sw.ElapsedMilliseconds;
-
-                    // 1) Frame start command (0x1001, u32 LE byte length) + read reply
-                    PutU32(startFrameCmd, 6, (uint)frame.Length);
-                    WritePipeWithZlp(hWinUsb, startFrameCmd, 0, startFrameCmd.Length);
-                    ReadCommandReply(hWinUsb, CmdStartFrame, readBuf);
-
-                    // 2) Raw RGB565 LE pixels in 131072-byte chunks (ZLP automatically appended on 4K-aligned chunks)
-                    for (int offset = 0; offset < frame.Length; offset += BulkChunkSize)
+                    try
                     {
-                        int len = Math.Min(BulkChunkSize, frame.Length - offset);
-                        WritePipeWithZlp(hWinUsb, frame, offset, len);
+                        // 1) Frame start command (0x1001, u32 LE byte length) + read reply
+                        PutU32(startFrameCmd, 6, (uint)frame.Length);
+                        WritePipeWithZlp(hWinUsb, startFrameCmd, 0, startFrameCmd.Length);
+                        ReadCommandReply(hWinUsb, CmdStartFrame, readBuf);
+
+                        // 2) Raw RGB565 LE pixels in 131072-byte chunks (ZLP automatically appended on 4K-aligned chunks)
+                        for (int offset = 0; offset < frame.Length; offset += BulkChunkSize)
+                        {
+                            int len = Math.Min(BulkChunkSize, frame.Length - offset);
+                            WritePipeWithZlp(hWinUsb, frame, offset, len);
+                        }
+                    }
+                    finally
+                    {
+                        lock (Sync) { _inUseFrame = null; }
                     }
 
                     FrameSent.Set();
@@ -263,9 +362,12 @@ namespace LcdFusion
                 {
                     _streamThread = null;
                     _currentBgra = null;
+                    _inUseBgra = null;
                     _currentBgraWidth = 0;
                     _currentBgraHeight = 0;
                     _currentFrame = null;
+                    _inUseFrame = null;
+                    _buildingFrame = null;
                 }
             }
         }
@@ -447,41 +549,73 @@ namespace LcdFusion
             }
         }
 
-        private static byte[] BuildRgb565Frame(byte[] bgra, int width, int height, byte brightness)
+        // 4x4 Bayer ordered dithering matrix (0..15) for smooth, color-balanced BGRA -> BGR565 quantization.
+        private static readonly int[] Bayer4x4 =
+        {
+             0,  8,  2, 10,
+            12,  4, 14,  6,
+             3, 11,  1,  9,
+            15,  7, 13,  5
+        };
+
+        private static int[] GetBrightnessLut5(byte brightness)
+        {
+            int br = brightness > 100 ? 100 : brightness;
+            lock (LutSync)
+            {
+                if (_cachedLut5 != null && _cachedLutBrightness == br)
+                    return _cachedLut5;
+
+                // Convert slider percentage (linear physical brightness) to sRGB scale (gamma ~2.2) so low
+                // settings (e.g. 5%) represent ~5% actual light instead of ~0.14% (which crushes dark tones to 0..1).
+                double scale = br >= 100 ? 1.0 : (br <= 0 ? 0.0 : Math.Pow(br / 100.0, 1.0 / 2.2));
+
+                // Precompute 4-bit fixed-point (16x) 5-bit target levels (0..31*16) shared by R, G, and B.
+                // Mapping G through the same 5-bit grid and expanding via bit-replication (g6 = (g5<<1)|(g5>>4))
+                // matches how 16-bit TFT panels expand 5-bit R/B to 6-bit DAC levels, eliminating odd G6=1
+                // green-only pixels that turn dark grays and blue-blacks green at low brightness.
+                int[] lut5 = new int[256];
+                for (int i = 0; i < 256; i++)
+                {
+                    int v16 = (int)Math.Round(i * scale * (31.0 * 16.0 / 255.0));
+                    if (v16 < 0) v16 = 0;
+                    else if (v16 > 31 * 16) v16 = 31 * 16;
+                    lut5[i] = v16;
+                }
+                _cachedLut5 = lut5;
+                _cachedLutBrightness = br;
+                return lut5;
+            }
+        }
+
+        private static byte[] BuildRgb565Frame(byte[] bgra, int width, int height, byte brightness, byte[] frame)
         {
             int pixelCount = width * height;
-            byte[] frame = new byte[pixelCount * 2];
-            int dst = 0;
-            int totalBytes = pixelCount * 4;
+            if (frame == null || frame.Length != pixelCount * 2)
+                frame = new byte[pixelCount * 2];
 
-            if (brightness >= 100)
+            int[] lut5 = GetBrightnessLut5(brightness);
+
+            int src = 0;
+            int dst = 0;
+            for (int y = 0; y < height; y++)
             {
-                for (int p = 0; p < totalBytes; p += 4)
+                int bayerRow = (y & 3) << 2;
+                for (int x = 0; x < width; x++)
                 {
-                    int b = bgra[p];
-                    int g = bgra[p + 1];
-                    int r = bgra[p + 2];
+                    int m = Bayer4x4[bayerRow | (x & 3)];
+                    int b5 = (lut5[bgra[src]] + m) >> 4;
+                    int g5 = (lut5[bgra[src + 1]] + m) >> 4;
+                    int r5 = (lut5[bgra[src + 2]] + m) >> 4;
+                    src += 4;
+
+                    int g6 = (g5 << 1) | (g5 >> 4);
+
                     // BoWei V2 480x480 panel expects BGR565 LE (bits 15..11 = B, 10..5 = G, 4..0 = R).
-                    int v = ((b & 0xF8) << 8) | ((g & 0xFC) << 3) | (r >> 3);
+                    int v = (b5 << 11) | (g6 << 5) | r5;
                     frame[dst++] = (byte)(v & 0xFF);
                     frame[dst++] = (byte)(v >> 8);
                 }
-                return frame;
-            }
-
-            int[] lut = new int[256];
-            for (int i = 0; i < 256; i++)
-                lut[i] = (i * brightness + 50) / 100;
-
-            for (int p = 0; p < totalBytes; p += 4)
-            {
-                int b = lut[bgra[p]];
-                int g = lut[bgra[p + 1]];
-                int r = lut[bgra[p + 2]];
-                // BoWei V2 480x480 panel expects BGR565 LE (bits 15..11 = B, 10..5 = G, 4..0 = R).
-                int v = ((b & 0xF8) << 8) | ((g & 0xFC) << 3) | (r >> 3);
-                frame[dst++] = (byte)(v & 0xFF);
-                frame[dst++] = (byte)(v >> 8);
             }
             return frame;
         }

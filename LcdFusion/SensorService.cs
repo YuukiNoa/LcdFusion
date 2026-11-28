@@ -369,15 +369,19 @@ namespace LcdFusion
                 double cpuTemp = double.NaN, gpuTemp = double.NaN;
                 using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(scope,
                     "SELECT Name, Identifier, Value FROM Sensor WHERE SensorType = 'Temperature'"))
+                using (ManagementObjectCollection results = searcher.Get())
                 {
-                    foreach (ManagementBaseObject mo in searcher.Get())
+                    foreach (ManagementBaseObject mo in results)
                     {
-                        string id = Convert.ToString(mo["Identifier"]).ToLowerInvariant();
-                        string name = Convert.ToString(mo["Name"]);
-                        double value = ToDouble(mo["Value"]);
-                        if (double.IsNaN(value)) continue;
-                        if (id.Contains("cpu") && (double.IsNaN(cpuTemp) || PreferTemp(name, cpuTemp))) cpuTemp = value;
-                        else if (id.Contains("gpu") && (double.IsNaN(gpuTemp) || PreferTemp(name, gpuTemp))) gpuTemp = value;
+                        using (mo)
+                        {
+                            string id = Convert.ToString(mo["Identifier"]).ToLowerInvariant();
+                            string name = Convert.ToString(mo["Name"]);
+                            double value = ToDouble(mo["Value"]);
+                            if (double.IsNaN(value)) continue;
+                            if (id.Contains("cpu") && (double.IsNaN(cpuTemp) || PreferTemp(name, cpuTemp))) cpuTemp = value;
+                            else if (id.Contains("gpu") && (double.IsNaN(gpuTemp) || PreferTemp(name, gpuTemp))) gpuTemp = value;
+                        }
                     }
                 }
 
